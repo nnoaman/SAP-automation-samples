@@ -48,21 +48,29 @@ SAP_DOWNLOAD_HOST = "softwaredownloads.sap.com"
 # ---------------------------------------------------------------------------
 
 class _FormParser(HTMLParser):
-    """Extract the first <form> action and all <input> fields from an HTML page."""
+    """Extract the first <form> action and all <input> fields within it."""
 
     def __init__(self):
         super().__init__()
         self.form_action: str = ""
         self.inputs: dict = {}
+        self.in_first_form = False
+        self.found_form = False
 
     def handle_starttag(self, tag, attrs):
         d = dict(attrs)
-        if tag == "form" and not self.form_action:
+        if tag == "form" and not self.found_form:
             self.form_action = d.get("action", "")
-        elif tag == "input":
+            self.in_first_form = True
+            self.found_form = True
+        elif tag == "input" and self.in_first_form:
             name = d.get("name", "")
             if name:
                 self.inputs[name] = d.get("value", "")
+
+    def handle_endtag(self, tag):
+        if tag == "form" and self.in_first_form:
+            self.in_first_form = False
 
 
 # ---------------------------------------------------------------------------
@@ -121,9 +129,40 @@ def create_sap_session(username, password, timeout):
     except requests.RequestException as e:
         return None, f"Login POST failed: {e}"
 
+    # SAP frequently uses an auto-submitting HTML form (SAML or OpenID Connect)
+    # to pass the authentication token back to softwaredownloads.sap.com.
+    # We must follow these SSO redirects manually since requests doesn't run JS.
+    for _ in range(5):
+        sso_fp = _FormParser()
+        sso_fp.feed(login_resp.text)
+
+        is_sso_form = any(
+            k in sso_fp.inputs
+            for k in ("SAMLResponse", "SAMLRequest", "code", "RelayState", "id_token")
+        )
+        if sso_fp.form_action and is_sso_form:
+            next_action = (
+                sso_fp.form_action
+                if sso_fp.form_action.startswith("http")
+                else urljoin(login_resp.url, sso_fp.form_action)
+            )
+            try:
+                login_resp = session.post(
+                    next_action,
+                    data=sso_fp.inputs,
+                    allow_redirects=True,
+                    timeout=timeout,
+                )
+            except requests.RequestException as e:
+                return None, f"SSO POST failed: {e}"
+        else:
+            break
+
     # 4. Verify: if still on the login page, credentials were rejected
-    if "accounts.sap.com" in login_resp.url:
-        return None, "SAP rejected credentials (still on login page after POST)"
+    check_fp = _FormParser()
+    check_fp.feed(login_resp.text)
+    if "j_password" in check_fp.inputs or "j_username" in check_fp.inputs:
+        return None, "SAP rejected credentials (login form reappeared)"
 
     return session.cookies.get_dict(), ""
 
