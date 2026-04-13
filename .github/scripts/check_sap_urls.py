@@ -91,7 +91,7 @@ def create_sap_session(username, password, timeout):
 
     if "accounts.sap.com" not in resp.url:
         # Unexpected — return cookies as-is
-        return dict(session.cookies), ""
+        return session.cookies.get_dict(), ""
 
     # 2. Parse the login form
     fp = _FormParser()
@@ -125,7 +125,7 @@ def create_sap_session(username, password, timeout):
     if "accounts.sap.com" in login_resp.url:
         return None, "SAP rejected credentials (still on login page after POST)"
 
-    return dict(session.cookies), ""
+    return session.cookies.get_dict(), ""
 
 
 # ---------------------------------------------------------------------------
