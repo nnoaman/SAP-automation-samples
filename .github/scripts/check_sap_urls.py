@@ -177,21 +177,28 @@ def verify_sap_session(session, probe_url, timeout):
     Returns an error string if it doesn't, empty string if it does.
     """
     try:
-        resp = session.get(
+        resp = session.head(
             probe_url,
             allow_redirects=True,
             timeout=timeout,
         )
-        if "tokengen" in resp.url:
+        # Some servers reject HEAD
+        if resp.status_code == 405:
+            resp = session.get(probe_url, allow_redirects=True, timeout=timeout, stream=True)
+            resp.close()
+
+        # If we get bounced back to accounts.sap.com, session didn't stick
+        if "accounts.sap.com" in resp.url:
+            return "Session did not persist — redirected back to SAP login page."
+
+        # A 403 means the S-User lacks download entitlement
+        if resp.status_code == 403:
             return (
-                f"Session cookies do not grant download access — "
-                f"SAP file requests still redirect to tokengen/ "
-                f"(Final URL: {resp.url}). "
-                f"Check that the S-User has Software Download authorisation."
+                f"SAP returned 403 Forbidden for probe URL. "
+                f"The S-User may lack Software Download authorisation."
             )
     except requests.RequestException as e:
         print(f"Network issue during probe: {e}")
-        pass  # Network issue on probe — proceed optimistically
     return ""
 
 
@@ -263,13 +270,15 @@ def check_url(url, source, timeout, sap_session):
             )
             resp.close()
 
-        # If the final URL contains tokengen/, our session cookies did not grant
-        # real download access — the result is unreliable (not a real 200/404).
-        if is_sap and "tokengen" in resp.url:
+        # If the final URL contains tokengen/, this is actually SAP's normal
+        # Azure CDN endpoint (origin-az.softwaredownloads.sap.com/tokengen/).
+        # A successful authenticated request lands here with HTTP 200.
+        # Only flag as skipped if we got bounced back to the login page.
+        if is_sap and "accounts.sap.com" in resp.url:
             return {
                 "url": url, "source": source,
                 "sap_url": True, "skipped": True,
-                "reason": "unauthenticated (tokengen redirect — cookies not effective)",
+                "reason": "session expired (redirected to login)",
             }
 
         broken = resp.status_code == 404
