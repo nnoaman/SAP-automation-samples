@@ -37,7 +37,7 @@ from urllib.parse import urljoin, urlparse
 import requests
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (SAP-URL-availability-check; non-interactive)",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
 }
 
 SAP_DOWNLOAD_HOST = "softwaredownloads.sap.com"
@@ -168,29 +168,29 @@ def create_sap_session(username, password, probe_url, timeout):
 
     # Return the raw RequestsCookieJar to preserve all cookie domains/paths.
     # get_dict() strips cross-domain info, breaking redirects to tokengen subdomains.
-    return session.cookies, ""
+    return session, ""
 
 
-def verify_sap_session(cookies, probe_url, timeout):
+def verify_sap_session(session, probe_url, timeout):
     """
-    Confirm that cookies actually grant download access by probing one SAP URL.
-    Returns an error string if they don't, empty string if they do.
+    Confirm that the session actually grants download access by probing one SAP URL.
+    Returns an error string if it doesn't, empty string if it does.
     """
     try:
-        resp = requests.get(
+        resp = session.get(
             probe_url,
-            headers=HEADERS,
-            cookies=cookies,
             allow_redirects=True,
             timeout=timeout,
         )
         if "tokengen" in resp.url:
             return (
-                "Session cookies do not grant download access — "
-                "SAP file requests still redirect to tokengen/. "
-                "Check that the S-User has Software Download authorisation."
+                f"Session cookies do not grant download access — "
+                f"SAP file requests still redirect to tokengen/ "
+                f"(Final URL: {resp.url}). "
+                f"Check that the S-User has Software Download authorisation."
             )
-    except requests.RequestException:
+    except requests.RequestException as e:
+        print(f"Network issue during probe: {e}")
         pass  # Network issue on probe — proceed optimistically
     return ""
 
@@ -219,44 +219,44 @@ def extract_urls(yaml_file):
 # URL checker
 # ---------------------------------------------------------------------------
 
-def check_url(url, source, timeout, sap_cookies):
+def check_url(url, source, timeout, sap_session):
     """
-    sap_cookies:
-      RequestsCookieJar → authenticated SAP cookies; use them for SAP URLs
+    sap_session:
+      requests.Session() → authenticated SAP session; use it for SAP URLs
       None  → no credentials provided; skip SAP URLs
       False → credentials provided but authentication/verification failed; skip SAP URLs
     """
     is_sap = urlparse(url).hostname == SAP_DOWNLOAD_HOST
 
-    if is_sap and sap_cookies is None:
+    if is_sap and sap_session is None:
         return {
             "url": url, "source": source,
             "sap_url": True, "skipped": True,
             "reason": "no credentials provided",
         }
 
-    if is_sap and sap_cookies is False:
+    if is_sap and sap_session is False:
         return {
             "url": url, "source": source,
             "sap_url": True, "skipped": True,
             "reason": "authentication failed",
         }
 
-    cookies = sap_cookies if is_sap else None
+    req_session = sap_session if is_sap else requests
+    headers = None if is_sap else HEADERS
+
     try:
-        resp = requests.head(
+        resp = req_session.head(
             url,
-            headers=HEADERS,
-            cookies=cookies,
+            headers=headers,
             timeout=timeout,
             allow_redirects=True,
         )
         # Some servers reject HEAD; fall back to streaming GET
         if resp.status_code == 405:
-            resp = requests.get(
+            resp = req_session.get(
                 url,
-                headers=HEADERS,
-                cookies=cookies,
+                headers=headers,
                 timeout=timeout,
                 allow_redirects=True,
                 stream=True,
@@ -333,7 +333,7 @@ def main():
           f"checking with {args.workers} workers...")
 
     # -- Authenticate with SAP ------------------------------------------
-    sap_cookies = None
+    sap_session = None
     if args.sap_user and args.sap_password:
         print("Authenticating with SAP...")
         # Get one real URL to trigger the SSO flow properly
@@ -342,23 +342,22 @@ def main():
             "https://softwaredownloads.sap.com/index.jsp",
         )
 
-        sap_cookies, auth_err = create_sap_session(
+        sap_session, auth_err = create_sap_session(
             args.sap_user, args.sap_password, probe_url, args.timeout
         )
         if auth_err:
             print(f"::warning::SAP authentication failed: {auth_err}")
             print("SAP URLs will be skipped.")
-            sap_cookies = False  # credentials present but auth failed
+            sap_session = False  # credentials present but auth failed
         else:
             print("SAP authentication successful.")
 
             if probe_url.startswith("http"):
-                verify_err = verify_sap_session(sap_cookies, probe_url, args.timeout)
+                verify_err = verify_sap_session(sap_session, probe_url, args.timeout)
                 if verify_err:
                     print(f"::warning::SAP session verification failed: {verify_err}")
                     print("SAP URLs will be skipped.")
-                    sap_cookies = False  # credentials present but session not effective
-                else:
+                    sap_session = False  # credentials present but session not effective
                     print("SAP session verified — download access confirmed.")
             else:
                 print("No SAP URLs found to probe; skipping session verification.")
@@ -372,8 +371,8 @@ def main():
         futures = {
             executor.submit(
                 check_url, url, source, args.timeout,
-                # Pass real cookies for SAP URLs, None for non-SAP
-                sap_cookies if urlparse(url).hostname == SAP_DOWNLOAD_HOST else None
+                # Pass real session for SAP URLs, None for non-SAP
+                sap_session if urlparse(url).hostname == SAP_DOWNLOAD_HOST else None
             ): url
             for url, source in unique_urls
         }
