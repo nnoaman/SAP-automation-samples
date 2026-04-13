@@ -87,3 +87,14 @@ jobs:
           name: url-check-results
           path: url-check-results.json
           retention-days: 30
+
+      - name: Fail if broken URLs were found
+        if: always()
+        run: |
+          NOT_FOUND=${{ steps.check.outputs.not_found_count || 0 }}
+          ERRORS=${{ steps.check.outputs.error_count || 0 }}
+          if [ "$NOT_FOUND" -gt 0 ] || [ "$ERRORS" -gt 0 ]; then
+            echo "::error::URL check failed: ${NOT_FOUND} 404(s), ${ERRORS} connection error(s). See the job summary and artifact for details."
+            exit 1
+          fi
+          echo "All URLs are reachable (no 404s or connection errors)."

@@ -13,7 +13,6 @@ import concurrent.futures
 import json
 import os
 import re
-import sys
 from pathlib import Path
 
 import requests
@@ -121,6 +120,8 @@ def main():
     print(f"Results written to '{args.output}'")
 
     not_found = [r for r in results if r.get("status") == 404]
+    errors    = [r for r in results if "error" in r]
+
     if not_found:
         print(f"\n{'='*60}")
         print(f"  404 NOT FOUND: {len(not_found)} URL(s)")
@@ -128,9 +129,22 @@ def main():
         for r in not_found:
             print(f"  {r['url']}")
             print(f"    source: {r['source']}")
-        sys.exit(1)
+    else:
+        print("No 404s found.")
 
-    print("All URLs responded (no 404s found).")
+    if errors:
+        print(f"\n  Connection errors: {len(errors)} URL(s)")
+        for r in errors:
+            print(f"  {r['url']}  ({r['error']})")
+            print(f"    source: {r['source']}")
+
+    github_output = os.environ.get("GITHUB_OUTPUT")
+    if github_output:
+        with open(github_output, "a") as f:
+            f.write(f"not_found_count={len(not_found)}\n")
+            f.write(f"error_count={len(errors)}\n")
+
+    print(f"\nDone. Results written to '{args.output}'")
 
 
 if __name__ == "__main__":
