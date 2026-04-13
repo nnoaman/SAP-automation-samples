@@ -81,8 +81,8 @@ def create_sap_session(username, password, probe_url, timeout):
     """
     Authenticate with SAP accounts.sap.com via form-based OAuth.
 
-    Returns (cookies_dict, error_str).
-    cookies_dict is None on failure; error_str is empty on success.
+    Returns (requests.Session, error_str).
+    session is None on failure; error_str is empty on success.
     """
     session = requests.Session()
     session.headers.update(HEADERS)
@@ -100,8 +100,8 @@ def create_sap_session(username, password, probe_url, timeout):
         return None, f"Could not reach SAP portal: {e}"
 
     if "accounts.sap.com" not in resp.url:
-        # Unexpected — return raw cookie jar as-is
-        return session.cookies, ""
+        # Unexpected — return the session as-is
+        return session, ""
 
     # 2. Parse the login form
     fp = _FormParser()
