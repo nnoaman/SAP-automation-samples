@@ -89,8 +89,18 @@ jobs:
                   lines.append(f"| {code} | {len(by_code[code])} |")
 
           if skipped:
+              by_reason = {}
+              for r in skipped:
+                  by_reason.setdefault(r.get("reason", "unknown"), []).append(r)
+
               lines.append(f"\n### ⏭️ Skipped SAP URLs ({len(skipped)})\n")
-              lines.append("> SAP credentials were not provided. Add `S_USERNAME` and `S_PASSWORD` repository secrets to enable full checking.")
+              if "no credentials provided" in by_reason:
+                  lines.append("> **No SAP credentials provided.** Add `S_USERNAME` and `S_PASSWORD` repository secrets to enable full checking.")
+              if "authentication failed" in by_reason:
+                  lines.append("> **SAP authentication failed.** Credentials were found but login was rejected — check the step logs for details (wrong password, or SAP changed their login flow).")
+              for reason, items in by_reason.items():
+                  if reason not in ("no credentials provided", "authentication failed"):
+                      lines.append(f"> Skipped ({reason}): {len(items)} URL(s)")
 
           if not_found:
               lines.append(f"\n### ❌ 404 Not Found ({len(not_found)})\n")

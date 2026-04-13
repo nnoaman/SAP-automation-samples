@@ -180,8 +180,8 @@ def check_url(url, source, timeout, sap_cookies):
     """
     sap_cookies:
       dict  → authenticated SAP cookies; use them for SAP URLs
-      None  → no credentials; skip SAP URLs
-      {}    → non-SAP URL; check without extra cookies
+      None  → no credentials provided; skip SAP URLs
+      False → credentials provided but authentication/verification failed; skip SAP URLs
     """
     is_sap = urlparse(url).hostname == SAP_DOWNLOAD_HOST
 
@@ -189,7 +189,14 @@ def check_url(url, source, timeout, sap_cookies):
         return {
             "url": url, "source": source,
             "sap_url": True, "skipped": True,
-            "reason": "no SAP credentials provided",
+            "reason": "no credentials provided",
+        }
+
+    if is_sap and sap_cookies is False:
+        return {
+            "url": url, "source": source,
+            "sap_url": True, "skipped": True,
+            "reason": "authentication failed",
         }
 
     cookies = sap_cookies if is_sap else {}
@@ -292,7 +299,7 @@ def main():
         if auth_err:
             print(f"::warning::SAP authentication failed: {auth_err}")
             print("SAP URLs will be skipped.")
-            sap_cookies = None
+            sap_cookies = False  # credentials present but auth failed
         else:
             print("SAP authentication successful.")
             # Verify cookies actually grant download access using a real URL
@@ -306,7 +313,7 @@ def main():
                 if verify_err:
                     print(f"::warning::SAP session verification failed: {verify_err}")
                     print("SAP URLs will be skipped.")
-                    sap_cookies = None
+                    sap_cookies = False  # credentials present but session not effective
                 else:
                     print("SAP session verified — download access confirmed.")
             else:
