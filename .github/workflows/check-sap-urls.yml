@@ -28,6 +28,9 @@ jobs:
 
       - name: Extract and check URLs
         id: check
+        env:
+          S_USERNAME: ${{ secrets.S_USERNAME }}
+          S_PASSWORD: ${{ secrets.S_PASSWORD }}
         run: |
           python3 .github/scripts/check_sap_urls.py \
             --sap-dir SAP \
@@ -45,39 +48,60 @@ jobs:
           with open("url-check-results.json") as f:
               results = json.load(f)
 
-          total   = len(results)
+          total     = len(results)
+          skipped   = [r for r in results if r.get("skipped")]
+          checked   = [r for r in results if not r.get("skipped")]
+          sap_total = sum(1 for r in results if r.get("sap_url"))
+          broken    = [r for r in results if r.get("broken")]
+          not_found = [r for r in broken if r.get("status") == 404]
+          errors    = [r for r in broken if "error" in r]
+
+          # Status code frequency table (checked URLs only)
           by_code = {}
-          for r in results:
-              code = r.get("status") or r.get("error", "error")
-              by_code.setdefault(code, []).append(r)
+          for r in checked:
+              label = r.get("status") or r.get("error", "error")
+              by_code.setdefault(label, []).append(r)
 
           lines = ["## SAP URL Check Results\n"]
-          lines.append(f"| Status | Count |")
-          lines.append(f"|--------|-------|")
-          for code in sorted(by_code, key=lambda x: str(x)):
-              lines.append(f"| {code} | {len(by_code[code])} |")
-          lines.append(f"\n**Total unique URLs checked:** {total}")
+          lines.append(f"| | Count |")
+          lines.append(f"|---|---|")
+          lines.append(f"| Total unique URLs | {total} |")
+          lines.append(f"| SAP URLs (softwaredownloads.sap.com) | {sap_total} |")
+          lines.append(f"| Non-SAP URLs | {total - sap_total} |")
+          lines.append(f"| Checked (authenticated) | {len(checked)} |")
+          lines.append(f"| Skipped (no SAP credentials) | {len(skipped)} |")
+          lines.append(f"| ❌ 404 Not Found | {len(not_found)} |")
+          lines.append(f"| ⚠️ Connection errors | {len(errors)} |")
 
-          not_found = by_code.get(404, [])
+          if by_code:
+              lines.append(f"\n### Status code breakdown (checked URLs)\n")
+              lines.append("| Status | Count |")
+              lines.append("|--------|-------|")
+              for code in sorted(by_code, key=lambda x: str(x)):
+                  lines.append(f"| {code} | {len(by_code[code])} |")
+
+          if skipped:
+              lines.append(f"\n### ⏭️ Skipped SAP URLs ({len(skipped)})\n")
+              lines.append("> SAP credentials were not provided. Add `S_USERNAME` and `S_PASSWORD` repository secrets to enable full checking.")
+
           if not_found:
-              lines.append(f"\n### 404 Not Found ({len(not_found)})\n")
+              lines.append(f"\n### ❌ 404 Not Found ({len(not_found)})\n")
               for r in not_found:
                   lines.append(f"- `{r['url']}`  \n  Source: `{r['source']}`")
 
-          errors = [r for code, rs in by_code.items() if isinstance(code, str) for r in rs]
           if errors:
-              lines.append(f"\n### Connection Errors ({len(errors)})\n")
-              for r in errors[:50]:   # cap at 50 to keep summary readable
+              lines.append(f"\n### ⚠️ Connection Errors ({len(errors)})\n")
+              for r in errors[:50]:
                   lines.append(f"- `{r['url']}`  \n  Error: {r.get('error')} | Source: `{r['source']}`")
               if len(errors) > 50:
-                  lines.append(f"\n_...and {len(errors) - 50} more. See the uploaded artifact for the full list._")
+                  lines.append(f"\n_...and {len(errors) - 50} more. See the uploaded artifact._")
+
+          if not broken and not skipped:
+              lines.append("\n### ✅ All URLs are valid.")
 
           summary = "\n".join(lines)
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
               f.write(summary + "\n")
-
-          if not_found:
-              print(f"::warning::{len(not_found)} URL(s) returned 404. Check the job summary for details.")
           EOF
 
       - name: Upload results artifact
