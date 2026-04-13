@@ -358,6 +358,7 @@ def main():
                     print(f"::warning::SAP session verification failed: {verify_err}")
                     print("SAP URLs will be skipped.")
                     sap_session = False  # credentials present but session not effective
+                else:
                     print("SAP session verified — download access confirmed.")
             else:
                 print("No SAP URLs found to probe; skipping session verification.")
