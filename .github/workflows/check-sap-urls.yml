@@ -62,6 +62,7 @@ jobs:
           sap_total = sum(1 for r in results if r.get("sap_url"))
           broken    = [r for r in results if r.get("broken")]
           not_found = [r for r in broken if r.get("status") == 404]
+          html_pages = [r for r in broken if r.get("reason", "").startswith("HTML error")]
           errors    = [r for r in broken if "error" in r]
 
           # Status code frequency table (checked URLs only)
@@ -76,10 +77,12 @@ jobs:
           lines.append(f"| Total unique URLs | {total} |")
           lines.append(f"| SAP URLs (softwaredownloads.sap.com) | {sap_total} |")
           lines.append(f"| Non-SAP URLs | {total - sap_total} |")
-          lines.append(f"| Checked (authenticated) | {len(checked)} |")
-          lines.append(f"| Skipped (no SAP credentials) | {len(skipped)} |")
-          lines.append(f"| ❌ 404 Not Found | {len(not_found)} |")
-          lines.append(f"| ⚠️ Connection errors | {len(errors)} |")
+          lines.append(f"| Checked | {len(checked)} |")
+          lines.append(f"| Skipped | {len(skipped)} |")
+          lines.append(f"| ❌ Broken (total) | {len(broken)} |")
+          lines.append(f"| — SAP file removed (HTML page) | {len(html_pages)} |")
+          lines.append(f"| — 404 Not Found | {len(not_found)} |")
+          lines.append(f"| — Connection errors | {len(errors)} |")
 
           if by_code:
               lines.append(f"\n### Status code breakdown (checked URLs)\n")
@@ -101,6 +104,14 @@ jobs:
               for reason, items in by_reason.items():
                   if reason not in ("no credentials provided", "authentication failed"):
                       lines.append(f"> Skipped ({reason}): {len(items)} URL(s)")
+
+          if html_pages:
+              lines.append(f"\n### ❌ SAP Files Removed ({len(html_pages)})\n")
+              lines.append("> These URLs returned HTTP 200 with `Content-Type: text/html` — SAP serves an HTML error page instead of the file.\n")
+              for r in html_pages[:100]:
+                  lines.append(f"- `{r['url']}`  \n  Source: `{r['source']}`")
+              if len(html_pages) > 100:
+                  lines.append(f"\n_...and {len(html_pages) - 100} more. See the uploaded artifact._")
 
           if not_found:
               lines.append(f"\n### ❌ 404 Not Found ({len(not_found)})\n")
@@ -133,10 +144,9 @@ jobs:
       - name: Fail if broken URLs were found
         if: always()
         run: |
-          NOT_FOUND=${{ steps.check.outputs.not_found_count || 0 }}
-          ERRORS=${{ steps.check.outputs.error_count || 0 }}
-          if [ "$NOT_FOUND" -gt 0 ] || [ "$ERRORS" -gt 0 ]; then
-            echo "::error::URL check failed: ${NOT_FOUND} 404(s), ${ERRORS} connection error(s). See the job summary and artifact for details."
+          BROKEN=${{ steps.check.outputs.broken_count || 0 }}
+          if [ "$BROKEN" -gt 0 ]; then
+            echo "::error::URL check found ${BROKEN} broken URL(s). See the job summary and artifact for details."
             exit 1
           fi
-          echo "All URLs are reachable (no 404s or connection errors)."
+          echo "All URLs are reachable."

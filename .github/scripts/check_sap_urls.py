@@ -11,8 +11,9 @@ impossible to distinguish a live file from a removed one without credentials.
 
 Set SAP_USERNAME and SAP_PASSWORD environment variables (S-User ID + password).
 With credentials:
-  - Existing file  → HTTP 200
-  - Removed file   → HTTP 404
+  - Existing file  → HTTP 200, binary Content-Type (e.g. application/octet-stream)
+  - Removed file   → HTTP 200, Content-Type: text/html (SAP error page)
+  We detect removed files by checking Content-Type, not HTTP status code.
 
 Without credentials:
   - SAP URLs are skipped and reported separately (not counted as failures).
@@ -20,13 +21,14 @@ Without credentials:
 
 Thread safety
 -------------
-The authenticated SAP session cookies are extracted once after login and
-injected into each per-thread request — the Session object itself is not
-shared across threads.
+After authentication, session cookies are serialized into a list of tuples.
+Each worker thread rebuilds its own RequestsCookieJar from these tuples,
+avoiding any shared mutable state (requests.Session is NOT thread-safe).
 """
 
 import argparse
 import concurrent.futures
+import copy
 import json
 import os
 import re
@@ -171,32 +173,58 @@ def create_sap_session(username, password, probe_url, timeout):
     return session, ""
 
 
+def _serialize_cookies(session):
+    """
+    Extract cookies from a requests.Session into a list of tuples.
+    This is thread-safe to pass to workers: each worker rebuilds its own jar.
+    """
+    return [
+        (c.name, c.value, c.domain, c.path)
+        for c in session.cookies
+    ]
+
+
+def _make_cookie_jar(cookie_tuples):
+    """Rebuild a RequestsCookieJar from serialized tuples."""
+    jar = requests.cookies.RequestsCookieJar()
+    for name, value, domain, path in cookie_tuples:
+        jar.set(name, value, domain=domain, path=path)
+    return jar
+
+
 def verify_sap_session(session, probe_url, timeout):
     """
-    Confirm that the session actually grants download access by probing one SAP URL.
-    Returns an error string if it doesn't, empty string if it does.
+    Confirm that the session grants download access by probing one SAP URL.
+    A real file download returns a binary Content-Type; an error page returns text/html.
+    Returns an error string if access fails, empty string on success.
     """
     try:
-        resp = session.head(
+        resp = session.get(
             probe_url,
             allow_redirects=True,
             timeout=timeout,
+            stream=True,
         )
-        # Some servers reject HEAD
-        if resp.status_code == 405:
-            resp = session.get(probe_url, allow_redirects=True, timeout=timeout, stream=True)
-            resp.close()
+        resp.close()
 
-        # If we get bounced back to accounts.sap.com, session didn't stick
+        # If we get bounced back to the login page, session didn't stick
         if "accounts.sap.com" in resp.url:
             return "Session did not persist — redirected back to SAP login page."
 
-        # A 403 means the S-User lacks download entitlement
         if resp.status_code == 403:
+            return "SAP returned 403 Forbidden. S-User may lack download authorisation."
+
+        if resp.status_code >= 400:
+            return f"SAP returned HTTP {resp.status_code} for probe URL."
+
+        content_type = resp.headers.get("Content-Type", "")
+        if "text/html" in content_type:
             return (
-                f"SAP returned 403 Forbidden for probe URL. "
-                f"The S-User may lack Software Download authorisation."
+                "SAP returned an HTML page instead of a file download. "
+                "The S-User may lack Software Download authorisation, "
+                "or the probe file no longer exists."
             )
+
     except requests.RequestException as e:
         print(f"Network issue during probe: {e}")
     return ""
@@ -226,68 +254,100 @@ def extract_urls(yaml_file):
 # URL checker
 # ---------------------------------------------------------------------------
 
-def check_url(url, source, timeout, sap_session):
+def check_url(url, source, timeout, sap_cookie_tuples):
     """
-    sap_session:
-      requests.Session() → authenticated SAP session; use it for SAP URLs
-      None  → no credentials provided; skip SAP URLs
-      False → credentials provided but authentication/verification failed; skip SAP URLs
+    Check a single URL for availability.
+
+    sap_cookie_tuples:
+      list   → serialized SAP cookies; rebuild a fresh jar per request (thread-safe)
+      None   → no credentials provided; skip SAP URLs
+      False  → credentials provided but auth failed; skip SAP URLs
+
+    For SAP URLs, a real file download returns a binary Content-Type (e.g.
+    application/octet-stream).  A removed/invalid file returns HTTP 200 with
+    Content-Type: text/html (SAP error page).  We use this to detect broken links.
     """
     is_sap = urlparse(url).hostname == SAP_DOWNLOAD_HOST
 
-    if is_sap and sap_session is None:
+    if is_sap and sap_cookie_tuples is None:
         return {
             "url": url, "source": source,
             "sap_url": True, "skipped": True,
             "reason": "no credentials provided",
         }
 
-    if is_sap and sap_session is False:
+    if is_sap and sap_cookie_tuples is False:
         return {
             "url": url, "source": source,
             "sap_url": True, "skipped": True,
             "reason": "authentication failed",
         }
 
-    req_session = sap_session if is_sap else requests
-    headers = None if is_sap else HEADERS
-
     try:
-        resp = req_session.head(
-            url,
-            headers=headers,
-            timeout=timeout,
-            allow_redirects=True,
-        )
-        # Some servers reject HEAD; fall back to streaming GET
-        if resp.status_code == 405:
-            resp = req_session.get(
+        if is_sap:
+            # Rebuild a fresh cookie jar for thread safety
+            jar = _make_cookie_jar(sap_cookie_tuples)
+            resp = requests.get(
                 url,
-                headers=headers,
+                headers=HEADERS,
+                cookies=jar,
                 timeout=timeout,
                 allow_redirects=True,
                 stream=True,
             )
             resp.close()
 
-        # If the final URL contains tokengen/, this is actually SAP's normal
-        # Azure CDN endpoint (origin-az.softwaredownloads.sap.com/tokengen/).
-        # A successful authenticated request lands here with HTTP 200.
-        # Only flag as skipped if we got bounced back to the login page.
-        if is_sap and "accounts.sap.com" in resp.url:
+            # Bounced back to login → session expired
+            if "accounts.sap.com" in resp.url:
+                return {
+                    "url": url, "source": source,
+                    "sap_url": True, "skipped": True,
+                    "reason": "session expired (redirected to login)",
+                }
+
+            # SAP returns 200 + text/html for missing files (error page)
+            content_type = resp.headers.get("Content-Type", "")
+            if resp.status_code == 200 and "text/html" in content_type:
+                return {
+                    "url": url, "source": source,
+                    "status": resp.status_code,
+                    "broken": True,
+                    "sap_url": True,
+                    "reason": "HTML error page (file likely removed)",
+                }
+
+            broken = resp.status_code >= 400
             return {
                 "url": url, "source": source,
-                "sap_url": True, "skipped": True,
-                "reason": "session expired (redirected to login)",
+                "status": resp.status_code,
+                "broken": broken,
+                "sap_url": True,
             }
+        else:
+            # Non-SAP URL: simple HEAD check
+            resp = requests.head(
+                url,
+                headers=HEADERS,
+                timeout=timeout,
+                allow_redirects=True,
+            )
+            if resp.status_code == 405:
+                resp = requests.get(
+                    url,
+                    headers=HEADERS,
+                    timeout=timeout,
+                    allow_redirects=True,
+                    stream=True,
+                )
+                resp.close()
 
-        broken = resp.status_code == 404
-        return {
-            "url": url, "source": source,
-            "status": resp.status_code,
-            "broken": broken,
-            "sap_url": is_sap,
-        }
+            broken = resp.status_code == 404
+            return {
+                "url": url, "source": source,
+                "status": resp.status_code,
+                "broken": broken,
+                "sap_url": False,
+            }
     except requests.exceptions.Timeout:
         return {"url": url, "source": source, "error": "timeout",
                 "broken": True, "sap_url": is_sap}
@@ -342,7 +402,7 @@ def main():
           f"checking with {args.workers} workers...")
 
     # -- Authenticate with SAP ------------------------------------------
-    sap_session = None
+    sap_cookie_tuples = None  # None = no creds, False = auth failed, list = cookies
     if args.sap_user and args.sap_password:
         print("Authenticating with SAP...")
         # Get one real URL to trigger the SSO flow properly
@@ -357,7 +417,7 @@ def main():
         if auth_err:
             print(f"::warning::SAP authentication failed: {auth_err}")
             print("SAP URLs will be skipped.")
-            sap_session = False  # credentials present but auth failed
+            sap_cookie_tuples = False
         else:
             print("SAP authentication successful.")
 
@@ -366,9 +426,12 @@ def main():
                 if verify_err:
                     print(f"::warning::SAP session verification failed: {verify_err}")
                     print("SAP URLs will be skipped.")
-                    sap_session = False  # credentials present but session not effective
+                    sap_cookie_tuples = False
                 else:
                     print("SAP session verified — download access confirmed.")
+                    # Serialize cookies for thread-safe usage
+                    sap_cookie_tuples = _serialize_cookies(sap_session)
+                    print(f"  ({len(sap_cookie_tuples)} cookies captured)")
             else:
                 print("No SAP URLs found to probe; skipping session verification.")
     else:
@@ -381,8 +444,7 @@ def main():
         futures = {
             executor.submit(
                 check_url, url, source, args.timeout,
-                # Pass real session for SAP URLs, None for non-SAP
-                sap_session if urlparse(url).hostname == SAP_DOWNLOAD_HOST else None
+                sap_cookie_tuples if urlparse(url).hostname == SAP_DOWNLOAD_HOST else None
             ): url
             for url, source in unique_urls
         }
@@ -397,26 +459,34 @@ def main():
         json.dump(results, f, indent=2)
 
     # -- Report ---------------------------------------------------------
-    skipped   = [r for r in results if r.get("skipped")]
-    broken    = [r for r in results if r.get("broken")]
-    not_found = [r for r in broken if r.get("status") == 404]
-    errors    = [r for r in broken if "error" in r]
+    skipped    = [r for r in results if r.get("skipped")]
+    broken     = [r for r in results if r.get("broken")]
+    not_found  = [r for r in broken if r.get("status") == 404]
+    html_pages = [r for r in broken if r.get("reason", "").startswith("HTML error")]
+    errors     = [r for r in broken if "error" in r]
 
     print(f"\n{'='*60}")
     print(f"  Checked : {len(results) - len(skipped)}")
-    print(f"  Skipped : {len(skipped)}  (SAP URLs — no credentials)")
-    print(f"  404s    : {len(not_found)}")
-    print(f"  Errors  : {len(errors)}")
+    print(f"  Skipped : {len(skipped)}")
+    print(f"  Broken  : {len(broken)}")
+    print(f"    404s            : {len(not_found)}")
+    print(f"    SAP HTML pages  : {len(html_pages)}  (file likely removed)")
+    print(f"    Conn errors     : {len(errors)}")
     print(f"{'='*60}")
 
+    if html_pages:
+        print(f"\nSAP FILES LIKELY REMOVED ({len(html_pages)}):")
+        for r in html_pages:
+            print(f"  {r['url']}\n    source: {r['source']}")
+
     if not_found:
-        print(f"\n404 NOT FOUND:")
+        print(f"\n404 NOT FOUND ({len(not_found)}):")
         for r in not_found:
             print(f"  {r['url']}\n    source: {r['source']}")
 
     if errors:
-        print(f"\nConnection errors:")
-        for r in errors:
+        print(f"\nConnection errors ({len(errors)}):")
+        for r in errors[:50]:
             print(f"  {r['url']}  ({r['error']})\n    source: {r['source']}")
 
     if skipped:
@@ -426,7 +496,9 @@ def main():
     github_output = os.environ.get("GITHUB_OUTPUT")
     if github_output:
         with open(github_output, "a") as f:
+            f.write(f"broken_count={len(broken)}\n")
             f.write(f"not_found_count={len(not_found)}\n")
+            f.write(f"html_page_count={len(html_pages)}\n")
             f.write(f"error_count={len(errors)}\n")
             f.write(f"skipped_count={len(skipped)}\n")
 
