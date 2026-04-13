@@ -43,10 +43,18 @@ jobs:
         if: always()
         run: |
           python3 - <<'EOF'
-          import json, os
+          import json, os, sys
 
-          with open("url-check-results.json") as f:
+          results_file = "url-check-results.json"
+          if not os.path.exists(results_file):
+              print("::error::url-check-results.json not found — the check script crashed before writing output. Check the step logs above.")
+              sys.exit(0)
+
+          with open(results_file) as f:
               results = json.load(f)
+
+          if not results:
+              print("::warning::url-check-results.json is empty — the check script may have crashed during execution.")
 
           total     = len(results)
           skipped   = [r for r in results if r.get("skipped")]

@@ -128,6 +128,30 @@ def create_sap_session(username, password, timeout):
     return session.cookies.get_dict(), ""
 
 
+def verify_sap_session(cookies, probe_url, timeout):
+    """
+    Confirm that cookies actually grant download access by probing one SAP URL.
+    Returns an error string if they don't, empty string if they do.
+    """
+    try:
+        resp = requests.get(
+            probe_url,
+            headers=HEADERS,
+            cookies=cookies,
+            allow_redirects=True,
+            timeout=timeout,
+        )
+        if "tokengen" in resp.url:
+            return (
+                "Session cookies do not grant download access — "
+                "SAP file requests still redirect to tokengen/. "
+                "Check that the S-User has Software Download authorisation."
+            )
+    except requests.RequestException:
+        pass  # Network issue on probe — proceed optimistically
+    return ""
+
+
 # ---------------------------------------------------------------------------
 # File helpers
 # ---------------------------------------------------------------------------
@@ -189,6 +213,15 @@ def check_url(url, source, timeout, sap_cookies):
             )
             resp.close()
 
+        # If the final URL contains tokengen/, our session cookies did not grant
+        # real download access — the result is unreliable (not a real 200/404).
+        if is_sap and "tokengen" in resp.url:
+            return {
+                "url": url, "source": source,
+                "sap_url": True, "skipped": True,
+                "reason": "unauthenticated (tokengen redirect — cookies not effective)",
+            }
+
         broken = resp.status_code == 404
         return {
             "url": url, "source": source,
@@ -226,24 +259,12 @@ def main():
     sap_dir      = Path(args.sap_dir)
     exclude_dirs = set(args.exclude_dirs)
 
-    # -- Authenticate with SAP ------------------------------------------
-    sap_cookies = None
-    if args.sap_user and args.sap_password:
-        print("Authenticating with SAP...")
-        sap_cookies, auth_err = create_sap_session(
-            args.sap_user, args.sap_password, args.timeout
-        )
-        if auth_err:
-            print(f"::warning::SAP authentication failed: {auth_err}")
-            print("SAP URLs will be skipped.")
-            sap_cookies = None
-        else:
-            print("SAP authentication successful.")
-    else:
-        print("No SAP credentials provided (set SAP_USERNAME / SAP_PASSWORD).")
-        print("SAP URLs will be skipped; only non-SAP URLs will be checked.")
+    # Write empty results immediately so the summary step always finds the file
+    # even if this script crashes before completing.
+    with open(args.output, "w") as f:
+        json.dump([], f)
 
-    # -- Scan YAML files ------------------------------------------------
+    # -- Scan YAML files first (probe URL comes from real data) -----------
     print(f"\nScanning YAML files under '{sap_dir}' (excluding: {exclude_dirs or 'none'})")
     yaml_files = find_yaml_files(sap_dir, exclude_dirs)
     print(f"Found {len(yaml_files)} YAML files")
@@ -260,6 +281,39 @@ def main():
     print(f"Found {len(unique_urls)} unique URLs "
           f"({sap_count} SAP, {other_count} non-SAP) — "
           f"checking with {args.workers} workers...")
+
+    # -- Authenticate with SAP ------------------------------------------
+    sap_cookies = None
+    if args.sap_user and args.sap_password:
+        print("Authenticating with SAP...")
+        sap_cookies, auth_err = create_sap_session(
+            args.sap_user, args.sap_password, args.timeout
+        )
+        if auth_err:
+            print(f"::warning::SAP authentication failed: {auth_err}")
+            print("SAP URLs will be skipped.")
+            sap_cookies = None
+        else:
+            print("SAP authentication successful.")
+            # Verify cookies actually grant download access using a real URL
+            # from the scanned BOM files — avoids any hardcoded probe URL.
+            probe_url = next(
+                (u for u, _ in unique_urls if urlparse(u).hostname == SAP_DOWNLOAD_HOST),
+                None,
+            )
+            if probe_url:
+                verify_err = verify_sap_session(sap_cookies, probe_url, args.timeout)
+                if verify_err:
+                    print(f"::warning::SAP session verification failed: {verify_err}")
+                    print("SAP URLs will be skipped.")
+                    sap_cookies = None
+                else:
+                    print("SAP session verified — download access confirmed.")
+            else:
+                print("No SAP URLs found to probe; skipping session verification.")
+    else:
+        print("No SAP credentials provided (set S_USERNAME / S_PASSWORD).")
+        print("SAP URLs will be skipped; only non-SAP URLs will be checked.")
 
     # -- Check URLs -----------------------------------------------------
     results = []
