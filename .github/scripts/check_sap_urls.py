@@ -77,7 +77,7 @@ class _FormParser(HTMLParser):
 # SAP authentication
 # ---------------------------------------------------------------------------
 
-def create_sap_session(username, password, timeout):
+def create_sap_session(username, password, probe_url, timeout):
     """
     Authenticate with SAP accounts.sap.com via form-based OAuth.
 
@@ -87,10 +87,12 @@ def create_sap_session(username, password, timeout):
     session = requests.Session()
     session.headers.update(HEADERS)
 
-    # 1. Trigger the OAuth redirect by hitting the portal
+    # 1. Trigger the OAuth redirect by hitting an actual download URL
+    #    (Using a real file URL ensures the SSO RelayState is set up for file downloads,
+    #     whereas index.jsp might not grant the correct entitlement scopes).
     try:
         resp = session.get(
-            "https://softwaredownloads.sap.com/index.jsp",
+            probe_url or "https://softwaredownloads.sap.com/index.jsp",
             allow_redirects=True,
             timeout=timeout,
         )
@@ -98,8 +100,8 @@ def create_sap_session(username, password, timeout):
         return None, f"Could not reach SAP portal: {e}"
 
     if "accounts.sap.com" not in resp.url:
-        # Unexpected — return cookies as-is
-        return session.cookies.get_dict(), ""
+        # Unexpected — return raw cookie jar as-is
+        return session.cookies, ""
 
     # 2. Parse the login form
     fp = _FormParser()
@@ -164,7 +166,9 @@ def create_sap_session(username, password, timeout):
     if "j_password" in check_fp.inputs or "j_username" in check_fp.inputs:
         return None, "SAP rejected credentials (login form reappeared)"
 
-    return session.cookies.get_dict(), ""
+    # Return the raw RequestsCookieJar to preserve all cookie domains/paths.
+    # get_dict() strips cross-domain info, breaking redirects to tokengen subdomains.
+    return session.cookies, ""
 
 
 def verify_sap_session(cookies, probe_url, timeout):
@@ -218,7 +222,7 @@ def extract_urls(yaml_file):
 def check_url(url, source, timeout, sap_cookies):
     """
     sap_cookies:
-      dict  → authenticated SAP cookies; use them for SAP URLs
+      RequestsCookieJar → authenticated SAP cookies; use them for SAP URLs
       None  → no credentials provided; skip SAP URLs
       False → credentials provided but authentication/verification failed; skip SAP URLs
     """
@@ -238,7 +242,7 @@ def check_url(url, source, timeout, sap_cookies):
             "reason": "authentication failed",
         }
 
-    cookies = sap_cookies if is_sap else {}
+    cookies = sap_cookies if is_sap else None
     try:
         resp = requests.head(
             url,
@@ -332,8 +336,14 @@ def main():
     sap_cookies = None
     if args.sap_user and args.sap_password:
         print("Authenticating with SAP...")
+        # Get one real URL to trigger the SSO flow properly
+        probe_url = next(
+            (u for u, _ in unique_urls if urlparse(u).hostname == SAP_DOWNLOAD_HOST),
+            "https://softwaredownloads.sap.com/index.jsp",
+        )
+
         sap_cookies, auth_err = create_sap_session(
-            args.sap_user, args.sap_password, args.timeout
+            args.sap_user, args.sap_password, probe_url, args.timeout
         )
         if auth_err:
             print(f"::warning::SAP authentication failed: {auth_err}")
@@ -341,13 +351,8 @@ def main():
             sap_cookies = False  # credentials present but auth failed
         else:
             print("SAP authentication successful.")
-            # Verify cookies actually grant download access using a real URL
-            # from the scanned BOM files — avoids any hardcoded probe URL.
-            probe_url = next(
-                (u for u, _ in unique_urls if urlparse(u).hostname == SAP_DOWNLOAD_HOST),
-                None,
-            )
-            if probe_url:
+
+            if probe_url.startswith("http"):
                 verify_err = verify_sap_session(sap_cookies, probe_url, args.timeout)
                 if verify_err:
                     print(f"::warning::SAP session verification failed: {verify_err}")
@@ -367,8 +372,8 @@ def main():
         futures = {
             executor.submit(
                 check_url, url, source, args.timeout,
-                # Pass real cookies for SAP URLs, empty dict for non-SAP
-                sap_cookies if urlparse(url).hostname == SAP_DOWNLOAD_HOST else {}
+                # Pass real cookies for SAP URLs, None for non-SAP
+                sap_cookies if urlparse(url).hostname == SAP_DOWNLOAD_HOST else None
             ): url
             for url, source in unique_urls
         }
