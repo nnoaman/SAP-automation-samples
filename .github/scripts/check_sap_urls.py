@@ -195,8 +195,9 @@ def _make_cookie_jar(cookie_tuples):
 def verify_sap_session(session, probe_url, timeout):
     """
     Confirm that the session grants download access by probing one SAP URL.
-    A real file download returns a binary Content-Type; an error page returns text/html.
-    Returns an error string if access fails, empty string on success.
+    This is a diagnostic step — prints detailed info about SAP's response
+    so we can determine the correct detection method.
+    Returns an error string if access clearly fails, empty string to proceed.
     """
     try:
         resp = session.get(
@@ -205,7 +206,29 @@ def verify_sap_session(session, probe_url, timeout):
             timeout=timeout,
             stream=True,
         )
+
+        # Read a small chunk to inspect the body
+        body_preview = resp.raw.read(2000)
         resp.close()
+
+        content_type = resp.headers.get("Content-Type", "")
+        content_disp = resp.headers.get("Content-Disposition", "")
+        content_len  = resp.headers.get("Content-Length", "unknown")
+
+        print(f"\n--- SAP Probe Debug Info ---")
+        print(f"  Probe URL:           {probe_url}")
+        print(f"  Final URL:           {resp.url}")
+        print(f"  Status:              {resp.status_code}")
+        print(f"  Content-Type:        {content_type}")
+        print(f"  Content-Disposition: {content_disp}")
+        print(f"  Content-Length:      {content_len}")
+        print(f"  Redirect chain:      {[r.url for r in resp.history]}")
+        print(f"  Body preview (first 500 chars):")
+        try:
+            print(f"    {body_preview[:500].decode('utf-8', errors='replace')}")
+        except Exception:
+            print(f"    (binary data, first 50 bytes: {body_preview[:50]})")
+        print(f"--- End Debug Info ---\n")
 
         # If we get bounced back to the login page, session didn't stick
         if "accounts.sap.com" in resp.url:
@@ -217,13 +240,8 @@ def verify_sap_session(session, probe_url, timeout):
         if resp.status_code >= 400:
             return f"SAP returned HTTP {resp.status_code} for probe URL."
 
-        content_type = resp.headers.get("Content-Type", "")
-        if "text/html" in content_type:
-            return (
-                "SAP returned an HTML page instead of a file download. "
-                "The S-User may lack Software Download authorisation, "
-                "or the probe file no longer exists."
-            )
+        # For now, do NOT fail on content-type — let all URLs be checked
+        # so we can see the full picture of what SAP returns.
 
     except requests.RequestException as e:
         print(f"Network issue during probe: {e}")
@@ -295,7 +313,12 @@ def check_url(url, source, timeout, sap_cookie_tuples):
                 allow_redirects=True,
                 stream=True,
             )
+            # Read a small chunk to inspect content
+            body_start = resp.raw.read(500)
             resp.close()
+
+            content_type = resp.headers.get("Content-Type", "")
+            content_disp = resp.headers.get("Content-Disposition", "")
 
             # Bounced back to login → session expired
             if "accounts.sap.com" in resp.url:
@@ -305,21 +328,14 @@ def check_url(url, source, timeout, sap_cookie_tuples):
                     "reason": "session expired (redirected to login)",
                 }
 
-            # SAP returns 200 + text/html for missing files (error page)
-            content_type = resp.headers.get("Content-Type", "")
-            if resp.status_code == 200 and "text/html" in content_type:
-                return {
-                    "url": url, "source": source,
-                    "status": resp.status_code,
-                    "broken": True,
-                    "sap_url": True,
-                    "reason": "HTML error page (file likely removed)",
-                }
-
             broken = resp.status_code >= 400
             return {
                 "url": url, "source": source,
                 "status": resp.status_code,
+                "final_url": resp.url,
+                "content_type": content_type,
+                "content_disposition": content_disp,
+                "body_preview": body_start[:200].decode("utf-8", errors="replace"),
                 "broken": broken,
                 "sap_url": True,
             }
