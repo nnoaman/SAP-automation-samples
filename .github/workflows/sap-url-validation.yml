@@ -46,8 +46,7 @@ jobs:
 
       - name: Parse Summary
         if: always()
-        env:
-          GITHUB_STEP_SUMMARY: ${{ github.step_summary }}
+        shell: python
         run: |
           import sys
           import json
@@ -82,88 +81,3 @@ jobs:
               sys.exit(1)
           else:
               sys.exit(0)
-        shell: pythonname: Validate SAP URLs
-
-on:
-  push:
-    paths:
-      - 'SAP/**/*.yaml'
-      - 'SAP/**/*.yml'
-      - 'SAP/**/*.md'
-      - 'SAP/**/*.json'
-      - '.github/workflows/sap-url-validation.yml'
-  pull_request:
-    paths:
-      - 'SAP/**/*.yaml'
-      - 'SAP/**/*.yml'
-      - 'SAP/**/*.md'
-      - 'SAP/**/*.json'
-      - '.github/workflows/sap-url-validation.yml'
-  workflow_dispatch:
-
-jobs:
-  validate-urls:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Install Dependencies
-        run: pip install requests beautifulsoup4
-
-      - name: Validate URLs
-        env:
-          S_USERNAME: ${{ secrets.S_USERNAME }}
-          S_PASSWORD: ${{ secrets.S_PASSWORD }}
-        run: |
-          python3 .github/scripts/check_sap_urls.py \
-            --sap-dir SAP \
-            --exclude-dir SAP/archives \
-            --sap-user "$S_USERNAME" \
-            --sap-password "$S_PASSWORD" \
-            --output url-check-results.json
-
-      - name: Parse Summary
-        if: always()
-        run: |
-          import sys
-          import json
-          import os
-
-          # If the file wasn't created, something crashed horribly before evaluation
-          if not os.path.exists("url-check-results.json"):
-              print("Validation crashed prematurely. No results generated.")
-              sys.exit(1)
-
-          with open("url-check-results.json", "r") as f:
-              results = json.load(f)
-
-          all_checked = [r for r in results if not r.get("skipped")]
-          broken = [r for r in results if r.get("broken")]
-
-          # Write summary to GitHub Actions Step Summary
-          step_summary_file = os.environ.get('GITHUB_STEP_SUMMARY')
-
-          if step_summary_file:
-              with open(step_summary_file, "a") as f:
-                  if broken:
-                      f.write("### 🚨 SAP URL Validation Failed\n\n")
-                      f.write(f"**{len(broken)}** out of {len(all_checked)} URLs validated failed:\n\n")
-                      f.write("| URL | Reason | Source |\n|---|---|---|\n")
-                      for item in broken:
-                          reason = item.get("reason", item.get("error", "Unknown HTTP err"))
-                          f.write(f"| {item['url']} | {reason} | {item['source']} |\n")
-                  else:
-                      f.write("### ✅ SAP URL Validation Passed\n\n")
-                      f.write(f"All **{len(all_checked)}** URLs validated successfully!\n")
-
-          if broken:
-              sys.exit(1)
-          else:
-              sys.exit(0)
-        shell: python
