@@ -303,37 +303,51 @@ def check_url(url, source, timeout, sap_cookie_tuples):
 
     try:
         if is_sap:
-            # Rebuild a fresh session with SAP cookies for thread safety
+            # Assign the jar directly (not .update) to preserve domain/path info
+            # so cookies are correctly sent to both softwaredownloads.sap.com
+            # and accounts.sap.com during the tokengen/SAML chain.
             jar = _make_cookie_jar(sap_cookie_tuples)
             session = requests.Session()
             session.headers.update(HEADERS)
-            session.cookies.update(jar)
+            session.cookies = jar
 
-            # SAP download URLs go through a tokengen/SAML chain even when
-            # authenticated. We follow up to 5 auto-submitting HTML forms to
-            # reach the final response (binary file or error page).
-            # Use stream=True throughout so we never download the actual file body.
+            # SAP download URLs go through a multi-hop tokengen/SAML chain:
+            #   1. softwaredownloads.sap.com/file/XXX
+            #      → (302) origin-az.softwaredownloads.sap.com/tokengen/?file=XXX
+            #      → (200) HTML form auto-posted to accounts.sap.com/saml2/idp/sso
+            #   2. accounts.sap.com validates IDP session cookie, returns
+            #      (200) HTML form with SAMLResponse auto-posted back to SP
+            #   3. softwaredownloads.sap.com processes SAMLResponse, redirects to
+            #      CDN or returns an error HTML page if the file was removed.
+            #
+            # Use stream=True to avoid downloading large binary files.
+            # Read up to 64 KB per HTML page (SAMLResponse base64 can be large).
             resp = session.get(url, timeout=timeout, allow_redirects=True, stream=True)
 
-            for _ in range(5):
+            for _ in range(6):
                 content_type = resp.headers.get("Content-Type", "")
                 if "text/html" not in content_type:
-                    # Binary response — file exists, stop here
+                    # Binary/non-HTML response — stop here (file exists)
                     resp.close()
                     break
 
-                # Read just enough to detect the auto-submit form marker
-                chunk = resp.raw.read(4096, decode_content=True)
+                # Read enough to capture full SAML form (SAMLResponse can be ~10 KB)
+                chunk = resp.raw.read(65536, decode_content=True)
                 resp.close()
                 text = chunk.decode("utf-8", errors="replace")
 
-                if "document.forms[0].submit()" not in text:
-                    # HTML but no auto-submit form — final error/info page
-                    break
-
                 fp = _FormParser()
                 fp.feed(text)
-                if not fp.form_action:
+
+                # Follow the form if it's an auto-submit or carries SAML tokens
+                is_saml_form = any(
+                    k in fp.inputs
+                    for k in ("SAMLResponse", "SAMLRequest", "RelayState", "id_token")
+                )
+                is_autosubmit = "document.forms[0].submit()" in text
+
+                if not fp.form_action or (not is_saml_form and not is_autosubmit):
+                    # No form to follow — this is the final HTML page
                     break
 
                 action = (
@@ -349,24 +363,25 @@ def check_url(url, source, timeout, sap_cookie_tuples):
                     stream=True,
                 )
             else:
-                # Exhausted retries without escaping HTML loop
-                content_type = resp.headers.get("Content-Type", "")
+                # Loop exhausted — close whatever is open
                 resp.close()
 
             content_type = resp.headers.get("Content-Type", "")
             content_disp = resp.headers.get("Content-Disposition", "")
+            final_url = resp.url
 
-            # Bounced back to login → session expired
-            if "accounts.sap.com" in resp.url:
+            # If we ended up stuck on the IDP login page after the full chain,
+            # the session cookies didn't work — skip rather than mark broken.
+            if "accounts.sap.com" in final_url:
                 return {
                     "url": url, "source": source,
                     "sap_url": True, "skipped": True,
-                    "reason": "session expired (redirected to login)",
+                    "reason": "session expired (stuck on IDP after full SAML chain)",
                 }
 
-            # After following the full tokengen/SAML chain:
-            #   - Valid file   → binary Content-Type or Content-Disposition: attachment
-            #   - Missing file → HTTP 200 but still text/html (SAP error page)
+            # After the full chain:
+            #   Valid file   → binary Content-Type or Content-Disposition: attachment
+            #   Removed file → HTTP 200 text/html SAP error page (no download headers)
             is_html = "text/html" in content_type
             has_download = "attachment" in content_disp or not is_html
             broken = resp.status_code >= 400 or (is_html and not has_download)
@@ -379,7 +394,7 @@ def check_url(url, source, timeout, sap_cookie_tuples):
             return {
                 "url": url, "source": source,
                 "status": resp.status_code,
-                "final_url": resp.url,
+                "final_url": final_url,
                 "content_type": content_type,
                 "content_disposition": content_disp,
                 "broken": broken,
