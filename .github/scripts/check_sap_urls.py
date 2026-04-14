@@ -269,7 +269,7 @@ def extract_urls(yaml_file):
 # URL checker
 # ---------------------------------------------------------------------------
 
-def check_url(url, source, timeout, sap_auth):
+def check_url(url, source, timeout, sap_auth, debug=False):
     """
     Check a single URL for availability.
 
@@ -306,15 +306,24 @@ def check_url(url, source, timeout, sap_auth):
         if is_sap:
             session = _copy_session(sap_auth)
 
+            if debug:
+                print(f"\n[DEBUG] Tracing SAP URL: {url}")
+                print(f"  Cookies in session: {[(c.name, c.domain) for c in session.cookies]}")
+
             # Follow the tokengen → IDP → ACS chain using stream=True.
             # Read up to 128 KB per HTML hop (SAMLResponse base64 ≈ 10–20 KB).
             resp = session.get(url, timeout=timeout, allow_redirects=True, stream=True)
 
-            for _ in range(6):
+            for hop in range(6):
                 content_type = resp.headers.get("Content-Type", "")
+
+                if debug:
+                    print(f"  [hop {hop}] url={resp.url}  content-type={content_type}")
 
                 if "text/html" not in content_type:
                     # Binary / non-HTML → file exists
+                    if debug:
+                        print(f"  [hop {hop}] → binary/non-HTML, file exists")
                     resp.close()
                     break
 
@@ -325,6 +334,10 @@ def check_url(url, source, timeout, sap_auth):
 
                 fp = _FormParser()
                 fp.feed(text)
+
+                if debug:
+                    print(f"  [hop {hop}] form_action={fp.form_action!r}  inputs={list(fp.inputs.keys())}")
+                    print(f"  [hop {hop}] autosubmit={'document.forms[0].submit()' in text}  body_snippet={text[:200]!r}")
 
                 # The IDP login page (j_username present) but WITHOUT a SAMLResponse
                 # or SAMLRequest means the IDP session was not accepted and the user
@@ -344,6 +357,8 @@ def check_url(url, source, timeout, sap_auth):
                 )
 
                 if is_login_wall:
+                    if debug:
+                        print(f"  [hop {hop}] → LOGIN WALL detected (j_username present, no SAML payload, no autosubmit)")
                     return {
                         "url": url, "source": source,
                         "sap_url": True, "skipped": True,
@@ -352,6 +367,8 @@ def check_url(url, source, timeout, sap_auth):
 
                 if not fp.form_action or (not has_saml_payload and not is_autosubmit):
                     # No actionable form — this IS the final HTML page.
+                    if debug:
+                        print(f"  [hop {hop}] → no actionable form, treating as final HTML")
                     class _Final:  # noqa: N801
                         headers = {"Content-Type": "text/html"}
                         status_code = 200
@@ -364,6 +381,8 @@ def check_url(url, source, timeout, sap_auth):
                     if fp.form_action.startswith("http")
                     else urljoin(current_url, fp.form_action)
                 )
+                if debug:
+                    print(f"  [hop {hop}] → POSTing to {action}")
                 resp = session.post(
                     action,
                     data=fp.inputs,
@@ -522,6 +541,12 @@ def main():
                     # RequestsCookieJar.copy() to preserve all Cookie attributes.
                     sap_cookie_tuples = sap_session
                     print(f"  ({sum(1 for _ in sap_session.cookies)} cookies captured)")
+
+                    # --- Debug trace: follow the full SAML chain for one URL ---
+                    print("\nRunning hop-by-hop debug trace for probe URL...")
+                    _dbg = check_url(probe_url, "debug-probe", args.timeout, sap_cookie_tuples, debug=True)
+                    print(f"Debug trace result: {_dbg}")
+                    print()
             else:
                 print("No SAP URLs found to probe; skipping session verification.")
     else:
