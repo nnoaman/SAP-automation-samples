@@ -93,6 +93,16 @@ jobs:
                       return url, False, f"Auth Failed or Broken Link (Returned HTML)"
 
                   return url, True, f"HTTP {res.status_code}"
+              except Exception as e:
+                  return url, False, type(e).__name__
+
+          print(f"Found {len(all_urls)} unique URLs. Starting validation...")
+
+          errors = []
+          with ThreadPoolExecutor(max_workers=10) as executor:
+              results = executor.map(check_url, all_urls)
+              for url, is_valid, msg in results:
+                  if not is_valid:
                       print(f"❌ {url} - {msg}")
                       errors.append((url, msg))
                   # Optionally suppress success prints to keep logs clean
