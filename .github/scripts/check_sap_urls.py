@@ -548,8 +548,9 @@ def main():
             "https://softwaredownloads.sap.com/index.jsp",
         )
 
+        auth_timeout = max(args.timeout * 4, 60)
         sap_session, auth_err = create_sap_session(
-            args.sap_user, args.sap_password, probe_url, args.timeout
+            args.sap_user, args.sap_password, probe_url, auth_timeout
         )
         if auth_err:
             print(f"::warning::SAP authentication failed: {auth_err}")
@@ -559,7 +560,7 @@ def main():
             print("SAP authentication successful.")
 
             if probe_url.startswith("http"):
-                verify_err = verify_sap_session(sap_session, probe_url, args.timeout)
+                verify_err = verify_sap_session(sap_session, probe_url, auth_timeout)
                 if verify_err:
                     print(f"::warning::SAP session verification failed: {verify_err}")
                     print("SAP URLs will be skipped.")
