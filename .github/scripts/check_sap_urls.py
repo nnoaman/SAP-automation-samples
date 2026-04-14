@@ -9,7 +9,7 @@ directly on the download endpoint — the same mechanism used by the Ansible
 BOM downloader playbook (ansible.builtin.get_url with url_username/url_password
 and force_basic_auth=true, http_agent='SAP Software Download').
 
-Set S_USERNAME and S_PASSWORD environment variables (S-User ID + password).
+Set S_USERNAME and S_PASSWORD repository secrets (S-User ID + password).
 With credentials:
   - Existing file  → HTTP 200, binary Content-Type or Content-Disposition: attachment
   - Removed file   → HTTP 200, Content-Type: text/html (SAP error page)
@@ -100,7 +100,9 @@ def check_url(url, source, timeout, sap_user, sap_password, _retry=0):
             has_download = "attachment" in content_disp or not is_html
             broken = resp.status_code >= 400 or (is_html and not has_download)
             reason = None
-            if resp.status_code >= 400:
+            if resp.status_code == 403:
+                reason = "HTTP 403 Forbidden (file exists but S-user lacks entitlement)"
+            elif resp.status_code >= 400:
                 reason = f"HTTP {resp.status_code}"
             elif is_html and not has_download:
                 reason = "SAP returned HTML (file likely removed or unauthorised)"

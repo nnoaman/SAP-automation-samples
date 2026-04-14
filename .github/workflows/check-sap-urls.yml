@@ -2,11 +2,14 @@ name: Check SAP Download URLs
 
 on:
   schedule:
-    - cron: '0 6 * * 1'
+    - cron: '0 6 * * 1,4'
   workflow_dispatch:
 
 permissions:
   contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   check-urls:
@@ -36,8 +39,8 @@ jobs:
             --sap-dir SAP \
             --exclude-dir archives \
             --output url-check-results.json \
-            --timeout 15 \
-            --workers 20
+            --timeout 30 \
+            --workers 10
 
       - name: Generate summary
         if: always()
@@ -61,9 +64,9 @@ jobs:
           checked   = [r for r in results if not r.get("skipped")]
           sap_total = sum(1 for r in results if r.get("sap_url"))
           broken    = [r for r in results if r.get("broken")]
-          not_found = [r for r in broken if r.get("status") == 404]
-          html_pages = [r for r in broken if r.get("reason", "").startswith("HTML error")]
-          errors    = [r for r in broken if "error" in r]
+          not_found  = [r for r in broken if r.get("status") == 404]
+          forbidden  = [r for r in broken if r.get("status") == 403]
+          errors     = [r for r in broken if "error" in r]
 
           # Status code frequency table (checked URLs only)
           by_code = {}
@@ -80,8 +83,8 @@ jobs:
           lines.append(f"| Checked | {len(checked)} |")
           lines.append(f"| Skipped | {len(skipped)} |")
           lines.append(f"| ❌ Broken (total) | {len(broken)} |")
-          lines.append(f"| — SAP file removed (HTML page) | {len(html_pages)} |")
           lines.append(f"| — 404 Not Found | {len(not_found)} |")
+          lines.append(f"| — 403 Forbidden (no entitlement) | {len(forbidden)} |")
           lines.append(f"| — Connection errors | {len(errors)} |")
 
           if by_code:
@@ -105,17 +108,14 @@ jobs:
                   if reason not in ("no credentials provided", "authentication failed"):
                       lines.append(f"> Skipped ({reason}): {len(items)} URL(s)")
 
-          if html_pages:
-              lines.append(f"\n### ❌ SAP Files Removed ({len(html_pages)})\n")
-              lines.append("> These URLs returned HTTP 200 with `Content-Type: text/html` — SAP serves an HTML error page instead of the file.\n")
-              for r in html_pages[:100]:
-                  lines.append(f"- `{r['url']}`  \n  Source: `{r['source']}`")
-              if len(html_pages) > 100:
-                  lines.append(f"\n_...and {len(html_pages) - 100} more. See the uploaded artifact._")
-
           if not_found:
               lines.append(f"\n### ❌ 404 Not Found ({len(not_found)})\n")
               for r in not_found:
+                  lines.append(f"- `{r['url']}`  \n  Source: `{r['source']}`")
+
+          if forbidden:
+              lines.append(f"\n### 🔒 403 Forbidden — S-user lacks entitlement ({len(forbidden)})\n")
+              for r in forbidden:
                   lines.append(f"- `{r['url']}`  \n  Source: `{r['source']}`")
 
           if errors:
