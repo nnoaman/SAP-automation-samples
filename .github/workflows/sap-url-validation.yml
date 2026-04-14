@@ -36,121 +36,50 @@ jobs:
         env:
           S_USERNAME: ${{ secrets.S_USERNAME }}
           S_PASSWORD: ${{ secrets.S_PASSWORD }}
-        shell: python
         run: |
-          import os
-          import re
+          python3 .github/scripts/check_sap_urls.py \
+            --sap-dir SAP \
+            --exclude-dir SAP/archives \
+            --sap-user "$S_USERNAME" \
+            --sap-password "$S_PASSWORD" \
+            --output url-check-results.json
+        
+      - name: Parse Summary
+        if: always()
+        run: |
           import sys
-          import html
-          from concurrent.futures import ThreadPoolExecutor
-          import requests
-          from urllib.parse import urlparse
+          import json
+          import os
 
-          sap_dir = 'SAP'
-          exclude_dir = os.path.join(sap_dir, 'archives')
-          username = os.environ.get('S_USERNAME', '')
-          password = os.environ.get('S_PASSWORD', '')
+          # If the file wasn't created, something crashed horribly before evaluation
+          if not os.path.exists("url-check-results.json"):
+              print("Validation crashed prematurely. No results generated.")
+              sys.exit(1)
+              
+          with open("url-check-results.json", "r") as f:
+              results = json.load(f)
 
-          # 1. Find files
-          files_to_check = []
-          for root, _, files in os.walk(sap_dir):
-              if exclude_dir in root:
-                  continue
-              for file in files:
-                  if file.endswith(('.yaml', '.yml', '.md', '.json')):
-                      files_to_check.append(os.path.join(root, file))
-
-          # 2. Extract URLs
-          url_pattern = re.compile(r'https?://[^\s\'"<>\[\]()]+')
-          all_urls = set()
-          for filepath in files_to_check:
-              try:
-                  with open(filepath, 'r', encoding='utf-8') as f:
-                      for url in url_pattern.findall(f.read()):
-                          all_urls.add(url.rstrip('.,;:!?'))
-              except Exception:
-                  pass
-
-          if not all_urls:
-              print("No URLs found in the specified path.")
-              sys.exit(0)
-
-          # 3. Check logic
-          def check_url(url):
-              try:
-                  domain = urlparse(url).netloc
-                  session = requests.Session()
-                  session.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
-                  
-                  # Attach basic auth if it's an SAP domain
-                  if 'sap.com' in domain and username and password:
-                      session.auth = (username, password)
-
-                  # GET the URL
-                  res = session.get(url, allow_redirects=True, timeout=20)
-                  content_type = res.headers.get('Content-Type', '').lower()
-
-                  # SAML / SSO HANDSHAKE: If SAP intercepts with a Javascript form submit, parse and POST it
-                  if 'text/html' in content_type and 'document.forms[0].submit()' in res.text:
-                      body = res.text
-                      action_match = re.search(r'action="([^"]+)"', body, re.IGNORECASE)
-                      if action_match:
-                          action_url = html.unescape(action_match.group(1))
-                          if action_url.startswith('/'):
-                              action_url = f"https://{urlparse(res.url).netloc}{action_url}"
-                          
-                          # Grab hidden tokens 
-                          payload = {}
-                          for m in re.finditer(r'<input[^>]+name="([^"]+)"[^>]+value="([^"]*)"', body, re.IGNORECASE):
-                              payload[html.unescape(m.group(1))] = html.unescape(m.group(2))
-                              
-                          # Push SAML handshake forward
-                          res = session.post(action_url, data=payload, timeout=20)
-                          content_type = res.headers.get('Content-Type', '').lower()
-
-                  # If we are STILL looking at an HTML page for an SAP software download archive, the file is missing/unauthorized
-                  if 'softwaredownloads.sap.com' in domain and 'text/html' in content_type:
-                      return url, False, "Broken Link or Unauthorized (SAP Software Download returned HTML)"
-                      
-                  # Standard 404/500 evaluation
-                  if res.status_code >= 400:
-                      return url, False, f"HTTP {res.status_code}"
-                      
-                  return url, True, f"HTTP {res.status_code}"
-              except Exception as e:
-                  return url, False, type(e).__name__
-
-          print(f"Found {len(all_urls)} unique URLs. Validating actively without SAP debug noise...")
+          all_checked = [r for r in results if not r.get("skipped")]
+          broken = [r for r in results if r.get("broken")]
           
-          # 4. Threading
-          errors = []
-          with ThreadPoolExecutor(max_workers=20) as executor:
-              for url, is_valid, msg in executor.map(check_url, all_urls):
-                  if not is_valid:
-                      print(f"❌ {url} - {msg}")
-                      errors.append((url, msg))
-
-          # 5. Output
+          # Write summary to GitHub Actions Step Summary
           step_summary_file = os.environ.get('GITHUB_STEP_SUMMARY')
           
-          if errors:
-              print(f"\n--- VALIDATION FAILED ---")
-              print(f"{len(errors)} URL(s) failed validation. See summary above or in the Actions UI.")
-              
-              if step_summary_file:
-                  with open(step_summary_file, "a") as f:
+          if step_summary_file:
+              with open(step_summary_file, "a") as f:
+                  if broken:
                       f.write("### 🚨 SAP URL Validation Failed\n\n")
-                      f.write(f"**{len(errors)}** out of {len(all_urls)} URLs are broken or unauthorized:\n\n")
-                      f.write("| URL | Error |\n|---|---|\n")
-                      for err_url, err_msg in errors:
-                          f.write(f"| {err_url} | {err_msg} |\n")
-              
+                      f.write(f"**{len(broken)}** out of {len(all_checked)} URLs validated failed:\n\n")
+                      f.write("| URL | Reason | Source |\n|---|---|---|\n")
+                      for item in broken:
+                          reason = item.get("reason", item.get("error", "Unknown HTTP err"))
+                          f.write(f"| {item['url']} | {reason} | {item['source']} |\n")
+                  else:
+                      f.write("### ✅ SAP URL Validation Passed\n\n")
+                      f.write(f"All **{len(all_checked)}** URLs validated successfully!\n")
+
+          if broken:
               sys.exit(1)
           else:
-              print("\n--- VALIDATION SUCCESS ---")
-              print(f"All {len(all_urls)} URLs validated successfully!")
-              
-              if step_summary_file:
-                  with open(step_summary_file, "a") as f:
-                      f.write("### ✅ SAP URL Validation Passed\n\n")
-                      f.write(f"Successfully validated all **{len(all_urls)}** URLs.\n")
+              sys.exit(0)
+        shell: python
