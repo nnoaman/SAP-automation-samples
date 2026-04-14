@@ -89,9 +89,10 @@ def create_sap_session(username, password, probe_url, timeout):
     session = requests.Session()
     session.headers.update(HEADERS)
 
-    # 1. Trigger the OAuth redirect by hitting an actual download URL
-    #    (Using a real file URL ensures the SSO RelayState is set up for file downloads,
-    #     whereas index.jsp might not grant the correct entitlement scopes).
+    # 1. Trigger the OAuth redirect by hitting an actual download URL.
+    #    With a file URL, SAP first redirects to tokengen (HTML auto-submit
+    #    form → accounts.sap.com). requests follows HTTP redirects but NOT
+    #    HTML form submissions, so we must follow them manually.
     try:
         resp = session.get(
             probe_url or "https://softwaredownloads.sap.com/index.jsp",
@@ -101,8 +102,33 @@ def create_sap_session(username, password, probe_url, timeout):
     except requests.RequestException as e:
         return None, f"Could not reach SAP portal: {e}"
 
+    # 1b. Follow HTML auto-submit forms (tokengen etc.) until we reach the
+    #     accounts.sap.com IDP login page.
+    for _ in range(3):
+        if "accounts.sap.com" in resp.url:
+            break
+        ct = resp.headers.get("Content-Type", "")
+        if "text/html" not in ct:
+            return session, ""  # Binary or non-HTML — already authenticated
+        fp_pre = _FormParser()
+        fp_pre.feed(resp.text)
+        if not fp_pre.form_action:
+            return session, ""  # No form to follow — already authenticated
+        pre_action = (
+            fp_pre.form_action
+            if fp_pre.form_action.startswith("http")
+            else urljoin(resp.url, fp_pre.form_action)
+        )
+        try:
+            resp = session.post(
+                pre_action, data=fp_pre.inputs,
+                allow_redirects=True, timeout=timeout,
+            )
+        except requests.RequestException as e:
+            return None, f"Could not follow pre-login form: {e}"
+
     if "accounts.sap.com" not in resp.url:
-        # Unexpected — return the session as-is
+        # SAP did not redirect to IDP — return session as-is
         return session, ""
 
     # 2. Parse the login form
@@ -212,14 +238,18 @@ def verify_sap_session(session, probe_url, timeout):
         content_disp = resp.headers.get("Content-Disposition", "")
         content_len  = resp.headers.get("Content-Length", "unknown")
 
+        acct_cookies = [c.name for c in session.cookies if "accounts.sap.com" in c.domain]
+        sp_cookies   = [c.name for c in session.cookies if "softwaredownloads.sap.com" in c.domain]
         print(f"\n--- SAP Probe Debug Info ---")
-        print(f"  Probe URL:           {probe_url}")
-        print(f"  Final URL:           {resp.url}")
-        print(f"  Status:              {resp.status_code}")
-        print(f"  Content-Type:        {content_type}")
-        print(f"  Content-Disposition: {content_disp}")
-        print(f"  Content-Length:      {content_len}")
-        print(f"  Redirect chain:      {[r.url for r in resp.history]}")
+        print(f"  Probe URL:                  {probe_url}")
+        print(f"  Final URL:                  {resp.url}")
+        print(f"  Status:                     {resp.status_code}")
+        print(f"  Content-Type:               {content_type}")
+        print(f"  Content-Disposition:        {content_disp}")
+        print(f"  Content-Length:             {content_len}")
+        print(f"  Redirect chain:             {[r.url for r in resp.history]}")
+        print(f"  accounts.sap.com cookies:   {acct_cookies}")
+        print(f"  softwaredownloads cookies:  {sp_cookies}")
         print(f"  Body preview (first 500 chars):")
         try:
             print(f"    {body_preview[:500].decode('utf-8', errors='replace')}")
