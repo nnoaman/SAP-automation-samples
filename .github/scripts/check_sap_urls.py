@@ -303,19 +303,38 @@ def check_url(url, source, timeout, sap_cookie_tuples):
 
     try:
         if is_sap:
-            # Rebuild a fresh cookie jar for thread safety
+            # Rebuild a fresh session with SAP cookies for thread safety
             jar = _make_cookie_jar(sap_cookie_tuples)
-            resp = requests.get(
-                url,
-                headers=HEADERS,
-                cookies=jar,
-                timeout=timeout,
-                allow_redirects=True,
-                stream=True,
-            )
-            # Read a small chunk to inspect content
-            body_start = resp.raw.read(500)
-            resp.close()
+            session = requests.Session()
+            session.headers.update(HEADERS)
+            session.cookies.update(jar)
+
+            resp = session.get(url, timeout=timeout, allow_redirects=True)
+
+            # SAP download URLs go through a tokengen/SAML chain even when
+            # authenticated. Follow up to 5 auto-submitting HTML forms to reach
+            # the final response (binary file or error page).
+            for _ in range(5):
+                ct = resp.headers.get("Content-Type", "")
+                if "text/html" in ct and "document.forms[0].submit()" in resp.text:
+                    fp = _FormParser()
+                    fp.feed(resp.text)
+                    if fp.form_action:
+                        action = (
+                            fp.form_action
+                            if fp.form_action.startswith("http")
+                            else urljoin(resp.url, fp.form_action)
+                        )
+                        resp = session.post(
+                            action,
+                            data=fp.inputs,
+                            timeout=timeout,
+                            allow_redirects=True,
+                        )
+                    else:
+                        break
+                else:
+                    break
 
             content_type = resp.headers.get("Content-Type", "")
             content_disp = resp.headers.get("Content-Disposition", "")
@@ -328,15 +347,30 @@ def check_url(url, source, timeout, sap_cookie_tuples):
                     "reason": "session expired (redirected to login)",
                 }
 
-            broken = resp.status_code >= 400
+            # After following the full tokengen/SAML chain:
+            #   - Valid file   → binary Content-Type (application/octet-stream etc.)
+            #                    or Content-Disposition: attachment
+            #   - Missing file → HTTP 200 but Content-Type: text/html (SAP error page)
+            is_html = "text/html" in content_type
+            has_download = (
+                "attachment" in content_disp
+                or not is_html
+            )
+            broken = resp.status_code >= 400 or (is_html and not has_download)
+            reason = None
+            if resp.status_code >= 400:
+                reason = f"HTTP {resp.status_code}"
+            elif is_html and not has_download:
+                reason = "SAP returned HTML (file likely removed or unauthorised)"
+
             return {
                 "url": url, "source": source,
                 "status": resp.status_code,
                 "final_url": resp.url,
                 "content_type": content_type,
                 "content_disposition": content_disp,
-                "body_preview": body_start[:200].decode("utf-8", errors="replace"),
                 "broken": broken,
+                **({"reason": reason} if reason else {}),
                 "sap_url": True,
             }
         else:
@@ -478,7 +512,7 @@ def main():
     skipped    = [r for r in results if r.get("skipped")]
     broken     = [r for r in results if r.get("broken")]
     not_found  = [r for r in broken if r.get("status") == 404]
-    html_pages = [r for r in broken if r.get("reason", "").startswith("HTML error")]
+    html_pages = [r for r in broken if "html" in r.get("reason", "").lower() and r.get("sap_url")]
     errors     = [r for r in broken if "error" in r]
 
     print(f"\n{'='*60}")
