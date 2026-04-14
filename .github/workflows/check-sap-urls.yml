@@ -1,0 +1,152 @@
+name: Check SAP Download URLs
+
+on:
+  schedule:
+    - cron: '0 6 * * 1,4'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  check-urls:
+    name: Check SAP URLs
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install pyyaml requests
+
+      - name: Extract and check URLs
+        id: check
+        env:
+          S_USERNAME: ${{ secrets.S_USERNAME }}
+          S_PASSWORD: ${{ secrets.S_PASSWORD }}
+        run: |
+          python3 .github/scripts/check_sap_urls.py \
+            --sap-dir SAP \
+            --exclude-dir archives \
+            --output url-check-results.json \
+            --timeout 30 \
+            --workers 20
+
+      - name: Generate summary
+        if: always()
+        run: |
+          python3 - <<'EOF'
+          import json, os, sys
+
+          results_file = "url-check-results.json"
+          if not os.path.exists(results_file):
+              print("::error::url-check-results.json not found — the check script crashed before writing output. Check the step logs above.")
+              sys.exit(0)
+
+          with open(results_file) as f:
+              results = json.load(f)
+
+          if not results:
+              print("::warning::url-check-results.json is empty — the check script may have crashed during execution.")
+
+          total     = len(results)
+          skipped   = [r for r in results if r.get("skipped")]
+          checked   = [r for r in results if not r.get("skipped")]
+          sap_total = sum(1 for r in results if r.get("sap_url"))
+          broken    = [r for r in results if r.get("broken")]
+          not_found  = [r for r in broken if r.get("status") == 404]
+          forbidden  = [r for r in broken if r.get("status") == 403]
+          errors     = [r for r in broken if "error" in r]
+
+          # Status code frequency table (checked URLs only)
+          by_code = {}
+          for r in checked:
+              label = r.get("status") or r.get("error", "error")
+              by_code.setdefault(label, []).append(r)
+
+          lines = ["## SAP URL Check Results\n"]
+          lines.append(f"| | Count |")
+          lines.append(f"|---|---|")
+          lines.append(f"| Total unique URLs | {total} |")
+          lines.append(f"| SAP URLs (softwaredownloads.sap.com) | {sap_total} |")
+          lines.append(f"| Non-SAP URLs | {total - sap_total} |")
+          lines.append(f"| Checked | {len(checked)} |")
+          lines.append(f"| Skipped | {len(skipped)} |")
+          lines.append(f"| ❌ Broken (total) | {len(broken)} |")
+          lines.append(f"| — 404 Not Found | {len(not_found)} |")
+          lines.append(f"| — 403 Forbidden (no entitlement) | {len(forbidden)} |")
+          lines.append(f"| — Connection errors | {len(errors)} |")
+
+          if by_code:
+              lines.append(f"\n### Status code breakdown (checked URLs)\n")
+              lines.append("| Status | Count |")
+              lines.append("|--------|-------|")
+              for code in sorted(by_code, key=lambda x: str(x)):
+                  lines.append(f"| {code} | {len(by_code[code])} |")
+
+          if skipped:
+              by_reason = {}
+              for r in skipped:
+                  by_reason.setdefault(r.get("reason", "unknown"), []).append(r)
+
+              lines.append(f"\n### ⏭️ Skipped SAP URLs ({len(skipped)})\n")
+              if "no credentials provided" in by_reason:
+                  lines.append("> **No SAP credentials provided.** Add `S_USERNAME` and `S_PASSWORD` repository secrets to enable full checking.")
+              if "authentication failed" in by_reason:
+                  lines.append("> **SAP authentication failed.** Credentials were found but login was rejected — check the step logs for details (wrong password, or SAP changed their login flow).")
+              for reason, items in by_reason.items():
+                  if reason not in ("no credentials provided", "authentication failed"):
+                      lines.append(f"> Skipped ({reason}): {len(items)} URL(s)")
+
+          if not_found:
+              lines.append(f"\n### ❌ 404 Not Found ({len(not_found)})\n")
+              for r in not_found:
+                  lines.append(f"- `{r['url']}`  \n  Source: `{r['source']}`")
+
+          if forbidden:
+              lines.append(f"\n### 🔒 403 Forbidden — S-user lacks entitlement ({len(forbidden)})\n")
+              for r in forbidden:
+                  lines.append(f"- `{r['url']}`  \n  Source: `{r['source']}`")
+
+          if errors:
+              lines.append(f"\n### ⚠️ Connection Errors ({len(errors)})\n")
+              for r in errors[:50]:
+                  lines.append(f"- `{r['url']}`  \n  Error: {r.get('error')} | Source: `{r['source']}`")
+              if len(errors) > 50:
+                  lines.append(f"\n_...and {len(errors) - 50} more. See the uploaded artifact._")
+
+          if not broken and not skipped:
+              lines.append("\n### ✅ All URLs are valid.")
+
+          summary = "\n".join(lines)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+              f.write(summary + "\n")
+          EOF
+
+      - name: Upload results artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: url-check-results
+          path: url-check-results.json
+          retention-days: 30
+
+      - name: Fail if broken URLs were found
+        if: always()
+        run: |
+          BROKEN=${{ steps.check.outputs.broken_count || 0 }}
+          if [ "$BROKEN" -gt 0 ]; then
+            echo "::error::URL check found ${BROKEN} broken URL(s). See the job summary and artifact for details."
+            exit 1
+          fi
+          echo "All URLs are reachable."
