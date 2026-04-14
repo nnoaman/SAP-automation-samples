@@ -309,32 +309,49 @@ def check_url(url, source, timeout, sap_cookie_tuples):
             session.headers.update(HEADERS)
             session.cookies.update(jar)
 
-            resp = session.get(url, timeout=timeout, allow_redirects=True)
-
             # SAP download URLs go through a tokengen/SAML chain even when
-            # authenticated. Follow up to 5 auto-submitting HTML forms to reach
-            # the final response (binary file or error page).
+            # authenticated. We follow up to 5 auto-submitting HTML forms to
+            # reach the final response (binary file or error page).
+            # Use stream=True throughout so we never download the actual file body.
+            resp = session.get(url, timeout=timeout, allow_redirects=True, stream=True)
+
             for _ in range(5):
-                ct = resp.headers.get("Content-Type", "")
-                if "text/html" in ct and "document.forms[0].submit()" in resp.text:
-                    fp = _FormParser()
-                    fp.feed(resp.text)
-                    if fp.form_action:
-                        action = (
-                            fp.form_action
-                            if fp.form_action.startswith("http")
-                            else urljoin(resp.url, fp.form_action)
-                        )
-                        resp = session.post(
-                            action,
-                            data=fp.inputs,
-                            timeout=timeout,
-                            allow_redirects=True,
-                        )
-                    else:
-                        break
-                else:
+                content_type = resp.headers.get("Content-Type", "")
+                if "text/html" not in content_type:
+                    # Binary response — file exists, stop here
+                    resp.close()
                     break
+
+                # Read just enough to detect the auto-submit form marker
+                chunk = resp.raw.read(4096, decode_content=True)
+                resp.close()
+                text = chunk.decode("utf-8", errors="replace")
+
+                if "document.forms[0].submit()" not in text:
+                    # HTML but no auto-submit form — final error/info page
+                    break
+
+                fp = _FormParser()
+                fp.feed(text)
+                if not fp.form_action:
+                    break
+
+                action = (
+                    fp.form_action
+                    if fp.form_action.startswith("http")
+                    else urljoin(resp.url, fp.form_action)
+                )
+                resp = session.post(
+                    action,
+                    data=fp.inputs,
+                    timeout=timeout,
+                    allow_redirects=True,
+                    stream=True,
+                )
+            else:
+                # Exhausted retries without escaping HTML loop
+                content_type = resp.headers.get("Content-Type", "")
+                resp.close()
 
             content_type = resp.headers.get("Content-Type", "")
             content_disp = resp.headers.get("Content-Disposition", "")
@@ -348,14 +365,10 @@ def check_url(url, source, timeout, sap_cookie_tuples):
                 }
 
             # After following the full tokengen/SAML chain:
-            #   - Valid file   → binary Content-Type (application/octet-stream etc.)
-            #                    or Content-Disposition: attachment
-            #   - Missing file → HTTP 200 but Content-Type: text/html (SAP error page)
+            #   - Valid file   → binary Content-Type or Content-Disposition: attachment
+            #   - Missing file → HTTP 200 but still text/html (SAP error page)
             is_html = "text/html" in content_type
-            has_download = (
-                "attachment" in content_disp
-                or not is_html
-            )
+            has_download = "attachment" in content_disp or not is_html
             broken = resp.status_code >= 400 or (is_html and not has_download)
             reason = None
             if resp.status_code >= 400:
