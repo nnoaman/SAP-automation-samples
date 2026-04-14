@@ -24,6 +24,7 @@ import concurrent.futures
 import json
 import os
 import re
+import time
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -32,17 +33,6 @@ import requests
 SAP_DOWNLOAD_HOST = "softwaredownloads.sap.com"
 SAP_HTTP_AGENT    = "SAP Software Download"
 HEADERS = {"User-Agent": SAP_HTTP_AGENT}
-
-
-class _ForceBasicAuthSession(requests.Session):
-    """
-    Mirrors Ansible get_url's force_basic_auth=true behaviour:
-    the Authorization: Basic header is sent on every request including
-    all redirected hops, regardless of hostname changes.
-    requests.Session normally strips auth when redirecting cross-domain.
-    """
-    def rebuild_auth(self, prepared_request, response):
-        pass  # never strip auth
 
 
 class _ForceBasicAuthSession(requests.Session):
@@ -72,7 +62,7 @@ def extract_urls(yaml_file):
     return [(url, str(yaml_file)) for url in urls]
 
 
-def check_url(url, source, timeout, sap_user, sap_password):
+def check_url(url, source, timeout, sap_user, sap_password, _retry=0):
     """
     Check a single URL for availability.
 
@@ -143,11 +133,14 @@ def check_url(url, source, timeout, sap_user, sap_password):
                 "sap_url": False,
             }
 
-    except requests.exceptions.Timeout:
-        return {"url": url, "source": source, "error": "timeout",
-                "broken": True, "sap_url": is_sap}
-    except requests.exceptions.ConnectionError as e:
-        return {"url": url, "source": source, "error": f"connection_error: {e}",
+    except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+        # SAP rate-limits under load: connection refused, SSL EOF, reset, timeout.
+        # Retry once with a backoff pause before marking as broken.
+        error_str = "timeout" if isinstance(e, requests.exceptions.Timeout) else f"connection_error: {e}"
+        if _retry == 0:
+            time.sleep(10)
+            return check_url(url, source, timeout, sap_user, sap_password, _retry=1)
+        return {"url": url, "source": source, "error": error_str,
                 "broken": True, "sap_url": is_sap}
     except requests.exceptions.RequestException as e:
         return {"url": url, "source": source, "error": str(e),
