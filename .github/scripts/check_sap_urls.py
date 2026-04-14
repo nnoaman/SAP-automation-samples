@@ -4,280 +4,57 @@ Extract all unique URLs from SAP YAML BOM files and check their availability.
 
 SAP Authentication
 ------------------
-SAP Software Downloads (softwaredownloads.sap.com) uses OAuth via accounts.sap.com.
-Without authentication, EVERY URL — valid or missing — returns HTTP 302 → 200
-(SAP redirects all unauthenticated requests to its login/token page), so it is
-impossible to distinguish a live file from a removed one without credentials.
+SAP Software Downloads (softwaredownloads.sap.com) supports HTTP Basic Auth
+directly on the download endpoint — the same mechanism used by the Ansible
+BOM downloader playbook (ansible.builtin.get_url with url_username/url_password
+and force_basic_auth=true, http_agent='SAP Software Download').
 
-Set SAP_USERNAME and SAP_PASSWORD environment variables (S-User ID + password).
+Set S_USERNAME and S_PASSWORD environment variables (S-User ID + password).
 With credentials:
-  - Existing file  → HTTP 200, binary Content-Type (e.g. application/octet-stream)
+  - Existing file  → HTTP 200, binary Content-Type or Content-Disposition: attachment
   - Removed file   → HTTP 200, Content-Type: text/html (SAP error page)
-  We detect removed files by checking Content-Type, not HTTP status code.
 
 Without credentials:
   - SAP URLs are skipped and reported separately (not counted as failures).
   - Non-SAP URLs (e.g. download.oracle.com) are still checked.
-
-Thread safety
--------------
-After authentication, session cookies are serialized into a list of tuples.
-Each worker thread rebuilds its own RequestsCookieJar from these tuples,
-avoiding any shared mutable state (requests.Session is NOT thread-safe).
 """
 
 import argparse
 import concurrent.futures
-import copy
 import json
 import os
 import re
-from html.parser import HTMLParser
 from pathlib import Path
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urlparse
 
 import requests
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-}
-
 SAP_DOWNLOAD_HOST = "softwaredownloads.sap.com"
+SAP_HTTP_AGENT    = "SAP Software Download"
+HEADERS = {"User-Agent": SAP_HTTP_AGENT}
 
 
-# ---------------------------------------------------------------------------
-# HTML form parser (used to extract SAP login form fields)
-# ---------------------------------------------------------------------------
-
-class _FormParser(HTMLParser):
-    """Extract the first <form> action and all <input> fields within it."""
-
-    def __init__(self):
-        super().__init__()
-        self.form_action: str = ""
-        self.inputs: dict = {}
-        self.in_first_form = False
-        self.found_form = False
-
-    def handle_starttag(self, tag, attrs):
-        d = dict(attrs)
-        if tag == "form" and not self.found_form:
-            self.form_action = d.get("action", "")
-            self.in_first_form = True
-            self.found_form = True
-        elif tag == "input" and self.in_first_form:
-            name = d.get("name", "")
-            if name:
-                self.inputs[name] = d.get("value", "")
-
-    def handle_endtag(self, tag):
-        if tag == "form" and self.in_first_form:
-            self.in_first_form = False
-
-
-# ---------------------------------------------------------------------------
-# SAP authentication
-# ---------------------------------------------------------------------------
-
-def create_sap_session(username, password, probe_url, timeout):
+class _ForceBasicAuthSession(requests.Session):
     """
-    Authenticate with SAP accounts.sap.com via form-based OAuth.
-
-    Returns (requests.Session, error_str).
-    session is None on failure; error_str is empty on success.
+    Mirrors Ansible get_url's force_basic_auth=true behaviour:
+    the Authorization: Basic header is sent on every request including
+    all redirected hops, regardless of hostname changes.
+    requests.Session normally strips auth when redirecting cross-domain.
     """
-    session = requests.Session()
-    session.headers.update(HEADERS)
-
-    # 1. Trigger the OAuth redirect by hitting an actual download URL.
-    #    With a file URL, SAP first redirects to tokengen (HTML auto-submit
-    #    form → accounts.sap.com). requests follows HTTP redirects but NOT
-    #    HTML form submissions, so we must follow them manually.
-    try:
-        resp = session.get(
-            probe_url or "https://softwaredownloads.sap.com/index.jsp",
-            allow_redirects=True,
-            timeout=timeout,
-        )
-    except requests.RequestException as e:
-        return None, f"Could not reach SAP portal: {e}"
-
-    # 1b. Follow HTML auto-submit forms (tokengen etc.) until we reach the
-    #     accounts.sap.com IDP login page.
-    for _ in range(3):
-        if "accounts.sap.com" in resp.url:
-            break
-        ct = resp.headers.get("Content-Type", "")
-        if "text/html" not in ct:
-            return session, ""  # Binary or non-HTML — already authenticated
-        fp_pre = _FormParser()
-        fp_pre.feed(resp.text)
-        if not fp_pre.form_action:
-            return session, ""  # No form to follow — already authenticated
-        pre_action = (
-            fp_pre.form_action
-            if fp_pre.form_action.startswith("http")
-            else urljoin(resp.url, fp_pre.form_action)
-        )
-        try:
-            resp = session.post(
-                pre_action, data=fp_pre.inputs,
-                allow_redirects=True, timeout=timeout,
-            )
-        except requests.RequestException as e:
-            return None, f"Could not follow pre-login form: {e}"
-
-    if "accounts.sap.com" not in resp.url:
-        # SAP did not redirect to IDP — return session as-is
-        return session, ""
-
-    # 2. Parse the login form
-    fp = _FormParser()
-    fp.feed(resp.text)
-
-    if not fp.form_action:
-        return None, (
-            "Login form not found on SAP accounts page. "
-            "SAP may have changed their OAuth flow."
-        )
-
-    action = (
-        fp.form_action
-        if fp.form_action.startswith("http")
-        else urljoin(resp.url, fp.form_action)
-    )
-
-    # 3. Submit credentials — SAP uses j_username / j_password field names
-    login_data = {**fp.inputs, "j_username": username, "j_password": password}
-    try:
-        login_resp = session.post(
-            action,
-            data=login_data,
-            allow_redirects=True,
-            timeout=timeout,
-        )
-    except requests.RequestException as e:
-        return None, f"Login POST failed: {e}"
-
-    # SAP frequently uses an auto-submitting HTML form (SAML or OpenID Connect)
-    # to pass the authentication token back to softwaredownloads.sap.com.
-    # We must follow these SSO redirects manually since requests doesn't run JS.
-    for _ in range(5):
-        sso_fp = _FormParser()
-        sso_fp.feed(login_resp.text)
-
-        is_sso_form = any(
-            k in sso_fp.inputs
-            for k in ("SAMLResponse", "SAMLRequest", "code", "RelayState", "id_token")
-        )
-        if sso_fp.form_action and is_sso_form:
-            next_action = (
-                sso_fp.form_action
-                if sso_fp.form_action.startswith("http")
-                else urljoin(login_resp.url, sso_fp.form_action)
-            )
-            try:
-                login_resp = session.post(
-                    next_action,
-                    data=sso_fp.inputs,
-                    allow_redirects=True,
-                    timeout=timeout,
-                )
-            except requests.RequestException as e:
-                return None, f"SSO POST failed: {e}"
-        else:
-            break
-
-    # 4. Verify: if still on the login page, credentials were rejected
-    check_fp = _FormParser()
-    check_fp.feed(login_resp.text)
-    if "j_password" in check_fp.inputs or "j_username" in check_fp.inputs:
-        return None, "SAP rejected credentials (login form reappeared)"
-
-    # Return the raw RequestsCookieJar to preserve all cookie domains/paths.
-    # get_dict() strips cross-domain info, breaking redirects to tokengen subdomains.
-    return session, ""
+    def rebuild_auth(self, prepared_request, response):
+        pass  # never strip auth
 
 
-def _copy_session(sap_session):
+class _ForceBasicAuthSession(requests.Session):
     """
-    Create a fresh requests.Session whose cookie jar is a proper copy of the
-    authenticated session's jar.  Using RequestsCookieJar.copy() preserves
-    every Cookie object attribute — domain_specified, domain_initial_dot,
-    secure, httponly, expires … — that plain tuple serialisation loses.
-    Without those flags http.cookiejar's domain-matching policy refuses to
-    send the IDP session cookie in the cross-domain POST to accounts.sap.com,
-    so the IDP shows the login form instead of issuing a SAMLResponse.
+    Mirrors Ansible get_url's force_basic_auth=true behaviour:
+    the Authorization: Basic header is sent on every request including
+    all redirected hops, regardless of hostname changes.
+    requests.Session normally strips auth when redirecting cross-domain.
     """
-    new = requests.Session()
-    new.headers.update(HEADERS)
-    new.cookies = sap_session.cookies.copy()
-    return new
+    def rebuild_auth(self, prepared_request, response):
+        pass  # never strip auth
 
-
-def verify_sap_session(session, probe_url, timeout):
-    """
-    Confirm that the session grants download access by probing one SAP URL.
-    This is a diagnostic step — prints detailed info about SAP's response
-    so we can determine the correct detection method.
-    Returns an error string if access clearly fails, empty string to proceed.
-    """
-    try:
-        resp = session.get(
-            probe_url,
-            allow_redirects=True,
-            timeout=timeout,
-            stream=True,
-        )
-
-        # Read a small chunk to inspect the body
-        body_preview = resp.raw.read(2000)
-        resp.close()
-
-        content_type = resp.headers.get("Content-Type", "")
-        content_disp = resp.headers.get("Content-Disposition", "")
-        content_len  = resp.headers.get("Content-Length", "unknown")
-
-        acct_cookies = [c.name for c in session.cookies if "accounts.sap.com" in c.domain]
-        sp_cookies   = [c.name for c in session.cookies if "softwaredownloads.sap.com" in c.domain]
-        print(f"\n--- SAP Probe Debug Info ---")
-        print(f"  Probe URL:                  {probe_url}")
-        print(f"  Final URL:                  {resp.url}")
-        print(f"  Status:                     {resp.status_code}")
-        print(f"  Content-Type:               {content_type}")
-        print(f"  Content-Disposition:        {content_disp}")
-        print(f"  Content-Length:             {content_len}")
-        print(f"  Redirect chain:             {[r.url for r in resp.history]}")
-        print(f"  accounts.sap.com cookies:   {acct_cookies}")
-        print(f"  softwaredownloads cookies:  {sp_cookies}")
-        print(f"  Body preview (first 500 chars):")
-        try:
-            print(f"    {body_preview[:500].decode('utf-8', errors='replace')}")
-        except Exception:
-            print(f"    (binary data, first 50 bytes: {body_preview[:50]})")
-        print(f"--- End Debug Info ---\n")
-
-        # If we get bounced back to the login page, session didn't stick
-        if "accounts.sap.com" in resp.url:
-            return "Session did not persist — redirected back to SAP login page."
-
-        if resp.status_code == 403:
-            return "SAP returned 403 Forbidden. S-User may lack download authorisation."
-
-        if resp.status_code >= 400:
-            return f"SAP returned HTTP {resp.status_code} for probe URL."
-
-        # For now, do NOT fail on content-type — let all URLs be checked
-        # so we can see the full picture of what SAP returns.
-
-    except requests.RequestException as e:
-        print(f"Network issue during probe: {e}")
-    return ""
-
-
-# ---------------------------------------------------------------------------
-# File helpers
-# ---------------------------------------------------------------------------
 
 def find_yaml_files(sap_dir, exclude_dirs):
     return [
@@ -295,153 +72,41 @@ def extract_urls(yaml_file):
     return [(url, str(yaml_file)) for url in urls]
 
 
-# ---------------------------------------------------------------------------
-# URL checker
-# ---------------------------------------------------------------------------
-
-def check_url(url, source, timeout, sap_auth, debug=False):
+def check_url(url, source, timeout, sap_user, sap_password):
     """
     Check a single URL for availability.
 
-    sap_auth:
-      requests.Session → authenticated SAP session; _copy_session() is called
-                         to make a fresh independent session per URL check
-      None             → no credentials provided; SAP URLs are skipped
-      False            → authentication failed; SAP URLs are skipped
-
-    For SAP URLs every file request traverses a tokengen/SAML chain:
-      softwaredownloads.sap.com/file/ID
-        → 302 → tokengen (200 HTML auto-submit to accounts.sap.com IDP)
-        → POST accounts.sap.com/saml2/idp/sso  (IDP validates its session cookie)
-        → POST softwaredownloads.sap.com/saml2/sp/acs  (SAMLResponse)
-        → 302 → CDN binary stream  OR  HTML error page if the file was removed
+    SAP URLs: HTTP Basic Auth sent preemptively (force_basic_auth style).
+      Valid file   → binary Content-Type or Content-Disposition: attachment
+      Removed file → text/html, no attachment header
+    Non-SAP URLs: simple HEAD request.
     """
     is_sap = urlparse(url).hostname == SAP_DOWNLOAD_HOST
 
-    if is_sap and sap_auth is None:
+    if is_sap and not sap_user:
         return {
             "url": url, "source": source,
             "sap_url": True, "skipped": True,
             "reason": "no credentials provided",
         }
 
-    if is_sap and sap_auth is False:
-        return {
-            "url": url, "source": source,
-            "sap_url": True, "skipped": True,
-            "reason": "authentication failed",
-        }
-
     try:
         if is_sap:
-            session = _copy_session(sap_auth)
-
-            if debug:
-                print(f"\n[DEBUG] Tracing SAP URL: {url}")
-                print(f"  Cookies in session: {[(c.name, c.domain) for c in session.cookies]}")
-
-            # Follow the tokengen → IDP → ACS chain using stream=True.
-            # Read up to 128 KB per HTML hop (SAMLResponse base64 ≈ 10–20 KB).
-            resp = session.get(url, timeout=timeout, allow_redirects=True, stream=True)
-
-            for hop in range(6):
-                content_type = resp.headers.get("Content-Type", "")
-
-                if debug:
-                    print(f"  [hop {hop}] url={resp.url}  content-type={content_type}")
-
-                if "text/html" not in content_type:
-                    # Binary / non-HTML → file exists
-                    if debug:
-                        print(f"  [hop {hop}] → binary/non-HTML, file exists")
-                    resp.close()
-                    break
-
-                chunk = resp.raw.read(131072, decode_content=True)
-                current_url = resp.url
-                resp.close()
-                text = chunk.decode("utf-8", errors="replace")
-
-                fp = _FormParser()
-                fp.feed(text)
-
-                if debug:
-                    print(f"  [hop {hop}] form_action={fp.form_action!r}  inputs={list(fp.inputs.keys())}")
-                    print(f"  [hop {hop}] autosubmit={'document.forms[0].submit()' in text}  body_snippet={text[:200]!r}")
-
-                # The IDP login page (j_username present) but WITHOUT a SAMLResponse
-                # or SAMLRequest means the IDP session was not accepted and the user
-                # must log in manually — we cannot proceed, skip this URL.
-                # NOTE: j_username also appears on IDP pages that DO have SAMLRequest
-                # (the form carries the username field as hidden state), so we must
-                # check BOTH: j_username present AND no SAML payload.
-                has_saml_payload = any(
-                    k in fp.inputs
-                    for k in ("SAMLResponse", "SAMLRequest", "id_token")
-                )
-                is_autosubmit = "document.forms[0].submit()" in text
-                is_login_wall = (
-                    "j_username" in fp.inputs
-                    and not has_saml_payload
-                    and not is_autosubmit
-                )
-
-                if is_login_wall:
-                    if debug:
-                        print(f"  [hop {hop}] → LOGIN WALL detected (j_username present, no SAML payload, no autosubmit)")
-                    return {
-                        "url": url, "source": source,
-                        "sap_url": True, "skipped": True,
-                        "reason": "IDP session not accepted — login form appeared",
-                    }
-
-                if not fp.form_action or (not has_saml_payload and not is_autosubmit):
-                    # No actionable form — this IS the final HTML page.
-                    if debug:
-                        print(f"  [hop {hop}] → no actionable form, treating as final HTML")
-                    class _Final:  # noqa: N801
-                        headers = {"Content-Type": "text/html"}
-                        status_code = 200
-                        url = current_url
-                    resp = _Final()
-                    break
-
-                action = (
-                    fp.form_action
-                    if fp.form_action.startswith("http")
-                    else urljoin(current_url, fp.form_action)
-                )
-                if debug:
-                    print(f"  [hop {hop}] → POSTing to {action}")
-                resp = session.post(
-                    action,
-                    data=fp.inputs,
-                    timeout=timeout,
-                    allow_redirects=True,
-                    stream=True,
-                )
-            else:
-                # 6 hops exhausted — something unexpected; treat as error HTML
-                try:
-                    resp.close()
-                except Exception:
-                    pass
+            resp = _ForceBasicAuthSession().request(
+                "GET",
+                url,
+                auth=(sap_user, sap_password),
+                headers=HEADERS,
+                timeout=timeout,
+                allow_redirects=True,
+                stream=True,
+            )
+            resp.raw.read(256, decode_content=True)
+            resp.close()
 
             content_type = resp.headers.get("Content-Type", "")
             content_disp = resp.headers.get("Content-Disposition", "")
-            final_url = resp.url
-
-            # Safety net: if still on accounts.sap.com the session didn't work
-            if "accounts.sap.com" in final_url:
-                return {
-                    "url": url, "source": source,
-                    "sap_url": True, "skipped": True,
-                    "reason": "IDP session not accepted — stuck on accounts.sap.com",
-                }
-
-            # Valid file   → binary Content-Type or Content-Disposition: attachment
-            # Removed file → text/html with no download headers
-            is_html = "text/html" in content_type
+            is_html      = "text/html" in content_type
             has_download = "attachment" in content_disp or not is_html
             broken = resp.status_code >= 400 or (is_html and not has_download)
             reason = None
@@ -453,7 +118,7 @@ def check_url(url, source, timeout, sap_auth, debug=False):
             return {
                 "url": url, "source": source,
                 "status": resp.status_code,
-                "final_url": final_url,
+                "final_url": resp.url,
                 "content_type": content_type,
                 "content_disposition": content_disp,
                 "broken": broken,
@@ -461,23 +126,15 @@ def check_url(url, source, timeout, sap_auth, debug=False):
                 "sap_url": True,
             }
         else:
-            # Non-SAP URL: simple HEAD check
             resp = requests.head(
-                url,
-                headers=HEADERS,
-                timeout=timeout,
-                allow_redirects=True,
+                url, headers=HEADERS, timeout=timeout, allow_redirects=True,
             )
             if resp.status_code == 405:
                 resp = requests.get(
-                    url,
-                    headers=HEADERS,
-                    timeout=timeout,
-                    allow_redirects=True,
-                    stream=True,
+                    url, headers=HEADERS, timeout=timeout,
+                    allow_redirects=True, stream=True,
                 )
                 resp.close()
-
             broken = resp.status_code == 404
             return {
                 "url": url, "source": source,
@@ -485,6 +142,7 @@ def check_url(url, source, timeout, sap_auth, debug=False):
                 "broken": broken,
                 "sap_url": False,
             }
+
     except requests.exceptions.Timeout:
         return {"url": url, "source": source, "error": "timeout",
                 "broken": True, "sap_url": is_sap}
@@ -496,18 +154,13 @@ def check_url(url, source, timeout, sap_auth, debug=False):
                 "broken": True, "sap_url": is_sap}
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-
 def main():
     parser = argparse.ArgumentParser(description="Check SAP BOM URLs for availability.")
-    parser.add_argument("--sap-dir", default="SAP")
-    parser.add_argument("--exclude-dir", action="append", default=[], dest="exclude_dirs")
-    parser.add_argument("--output", default="url-check-results.json")
-    parser.add_argument("--timeout", type=int, default=15)
-    parser.add_argument("--workers", type=int, default=20)
-    # Credentials: CLI args take priority, then environment variables
+    parser.add_argument("--sap-dir",      default="SAP")
+    parser.add_argument("--exclude-dir",  action="append", default=[], dest="exclude_dirs")
+    parser.add_argument("--output",       default="url-check-results.json")
+    parser.add_argument("--timeout",      type=int, default=30)
+    parser.add_argument("--workers",      type=int, default=20)
     parser.add_argument("--sap-user",     default=os.environ.get("S_USERNAME", ""))
     parser.add_argument("--sap-password", default=os.environ.get("S_PASSWORD", ""))
     args = parser.parse_args()
@@ -515,12 +168,9 @@ def main():
     sap_dir      = Path(args.sap_dir)
     exclude_dirs = set(args.exclude_dirs)
 
-    # Write empty results immediately so the summary step always finds the file
-    # even if this script crashes before completing.
     with open(args.output, "w") as f:
         json.dump([], f)
 
-    # -- Scan YAML files first (probe URL comes from real data) -----------
     print(f"\nScanning YAML files under '{sap_dir}' (excluding: {exclude_dirs or 'none'})")
     yaml_files = find_yaml_files(sap_dir, exclude_dirs)
     print(f"Found {len(yaml_files)} YAML files")
@@ -538,59 +188,26 @@ def main():
           f"({sap_count} SAP, {other_count} non-SAP) — "
           f"checking with {args.workers} workers...")
 
-    # -- Authenticate with SAP ------------------------------------------
-    sap_cookie_tuples = None  # None = no creds, False = auth failed, list = cookies
-    if args.sap_user and args.sap_password:
-        print("Authenticating with SAP...")
-        # Get one real URL to trigger the SSO flow properly
-        probe_url = next(
-            (u for u, _ in unique_urls if urlparse(u).hostname == SAP_DOWNLOAD_HOST),
-            "https://softwaredownloads.sap.com/index.jsp",
-        )
-
-        auth_timeout = max(args.timeout * 4, 60)
-        sap_session, auth_err = create_sap_session(
-            args.sap_user, args.sap_password, probe_url, auth_timeout
-        )
-        if auth_err:
-            print(f"::warning::SAP authentication failed: {auth_err}")
-            print("SAP URLs will be skipped.")
-            sap_cookie_tuples = False
-        else:
-            print("SAP authentication successful.")
-
-            if probe_url.startswith("http"):
-                verify_err = verify_sap_session(sap_session, probe_url, auth_timeout)
-                if verify_err:
-                    print(f"::warning::SAP session verification failed: {verify_err}")
-                    print("SAP URLs will be skipped.")
-                    sap_cookie_tuples = False
-                else:
-                    print("SAP session verified — download access confirmed.")
-                    # Pass the session object directly; check_url copies the
-                    # cookie jar per URL via _copy_session(), which uses
-                    # RequestsCookieJar.copy() to preserve all Cookie attributes.
-                    sap_cookie_tuples = sap_session
-                    print(f"  ({sum(1 for _ in sap_session.cookies)} cookies captured)")
-
-                    # --- Debug trace: follow the full SAML chain for one URL ---
-                    print("\nRunning hop-by-hop debug trace for probe URL...")
-                    _dbg = check_url(probe_url, "debug-probe", args.timeout, sap_cookie_tuples, debug=True)
-                    print(f"Debug trace result: {_dbg}")
-                    print()
-            else:
-                print("No SAP URLs found to probe; skipping session verification.")
+    if args.sap_user:
+        print(f"SAP credentials provided — SAP URLs will be checked.")
+        if sap_count > 0:
+            probe_url = next(u for u, _ in unique_urls if urlparse(u).hostname == SAP_DOWNLOAD_HOST)
+            print(f"\nProbing SAP auth with: {probe_url}")
+            probe = check_url(probe_url, "probe", args.timeout, args.sap_user, args.sap_password)
+            print(f"  status={probe.get('status')}  content_type={probe.get('content_type')}  "
+                  f"broken={probe.get('broken')}  reason={probe.get('reason', '-')}")
+            print()
     else:
         print("No SAP credentials provided (set S_USERNAME / S_PASSWORD).")
         print("SAP URLs will be skipped; only non-SAP URLs will be checked.")
 
-    # -- Check URLs -----------------------------------------------------
     results = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as executor:
         futures = {
             executor.submit(
                 check_url, url, source, args.timeout,
-                sap_cookie_tuples if urlparse(url).hostname == SAP_DOWNLOAD_HOST else None
+                args.sap_user if urlparse(url).hostname == SAP_DOWNLOAD_HOST else "",
+                args.sap_password,
             ): url
             for url, source in unique_urls
         }
@@ -604,7 +221,6 @@ def main():
     with open(args.output, "w") as f:
         json.dump(results, f, indent=2)
 
-    # -- Report ---------------------------------------------------------
     skipped    = [r for r in results if r.get("skipped")]
     broken     = [r for r in results if r.get("broken")]
     not_found  = [r for r in broken if r.get("status") == 404]
@@ -638,7 +254,6 @@ def main():
     if skipped:
         print(f"\nSkipped {len(skipped)} SAP URL(s) — set S_USERNAME and S_PASSWORD to check them.")
 
-    # Write counts for the workflow fail step
     github_output = os.environ.get("GITHUB_OUTPUT")
     if github_output:
         with open(github_output, "a") as f:
