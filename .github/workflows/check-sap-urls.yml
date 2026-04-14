@@ -40,7 +40,7 @@ jobs:
             --exclude-dir archives \
             --output url-check-results.json \
             --timeout 30 \
-            --workers 10
+            --workers 20
 
       - name: Generate summary
         if: always()
