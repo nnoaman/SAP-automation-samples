@@ -173,23 +173,20 @@ def create_sap_session(username, password, probe_url, timeout):
     return session, ""
 
 
-def _serialize_cookies(session):
+def _copy_session(sap_session):
     """
-    Extract cookies from a requests.Session into a list of tuples.
-    This is thread-safe to pass to workers: each worker rebuilds its own jar.
+    Create a fresh requests.Session whose cookie jar is a proper copy of the
+    authenticated session's jar.  Using RequestsCookieJar.copy() preserves
+    every Cookie object attribute — domain_specified, domain_initial_dot,
+    secure, httponly, expires … — that plain tuple serialisation loses.
+    Without those flags http.cookiejar's domain-matching policy refuses to
+    send the IDP session cookie in the cross-domain POST to accounts.sap.com,
+    so the IDP shows the login form instead of issuing a SAMLResponse.
     """
-    return [
-        (c.name, c.value, c.domain, c.path)
-        for c in session.cookies
-    ]
-
-
-def _make_cookie_jar(cookie_tuples):
-    """Rebuild a RequestsCookieJar from serialized tuples."""
-    jar = requests.cookies.RequestsCookieJar()
-    for name, value, domain, path in cookie_tuples:
-        jar.set(name, value, domain=domain, path=path)
-    return jar
+    new = requests.Session()
+    new.headers.update(HEADERS)
+    new.cookies = sap_session.cookies.copy()
+    return new
 
 
 def verify_sap_session(session, probe_url, timeout):
@@ -272,29 +269,33 @@ def extract_urls(yaml_file):
 # URL checker
 # ---------------------------------------------------------------------------
 
-def check_url(url, source, timeout, sap_cookie_tuples):
+def check_url(url, source, timeout, sap_auth):
     """
     Check a single URL for availability.
 
-    sap_cookie_tuples:
-      list   → serialized SAP cookies; rebuild a fresh jar per request (thread-safe)
-      None   → no credentials provided; skip SAP URLs
-      False  → credentials provided but auth failed; skip SAP URLs
+    sap_auth:
+      requests.Session → authenticated SAP session; _copy_session() is called
+                         to make a fresh independent session per URL check
+      None             → no credentials provided; SAP URLs are skipped
+      False            → authentication failed; SAP URLs are skipped
 
-    For SAP URLs, a real file download returns a binary Content-Type (e.g.
-    application/octet-stream).  A removed/invalid file returns HTTP 200 with
-    Content-Type: text/html (SAP error page).  We use this to detect broken links.
+    For SAP URLs every file request traverses a tokengen/SAML chain:
+      softwaredownloads.sap.com/file/ID
+        → 302 → tokengen (200 HTML auto-submit to accounts.sap.com IDP)
+        → POST accounts.sap.com/saml2/idp/sso  (IDP validates its session cookie)
+        → POST softwaredownloads.sap.com/saml2/sp/acs  (SAMLResponse)
+        → 302 → CDN binary stream  OR  HTML error page if the file was removed
     """
     is_sap = urlparse(url).hostname == SAP_DOWNLOAD_HOST
 
-    if is_sap and sap_cookie_tuples is None:
+    if is_sap and sap_auth is None:
         return {
             "url": url, "source": source,
             "sap_url": True, "skipped": True,
             "reason": "no credentials provided",
         }
 
-    if is_sap and sap_cookie_tuples is False:
+    if is_sap and sap_auth is False:
         return {
             "url": url, "source": source,
             "sap_url": True, "skipped": True,
@@ -303,57 +304,65 @@ def check_url(url, source, timeout, sap_cookie_tuples):
 
     try:
         if is_sap:
-            # Assign the jar directly (not .update) to preserve domain/path info
-            # so cookies are correctly sent to both softwaredownloads.sap.com
-            # and accounts.sap.com during the tokengen/SAML chain.
-            jar = _make_cookie_jar(sap_cookie_tuples)
-            session = requests.Session()
-            session.headers.update(HEADERS)
-            session.cookies = jar
+            session = _copy_session(sap_auth)
 
-            # SAP download URLs go through a multi-hop tokengen/SAML chain:
-            #   1. softwaredownloads.sap.com/file/XXX
-            #      → (302) origin-az.softwaredownloads.sap.com/tokengen/?file=XXX
-            #      → (200) HTML form auto-posted to accounts.sap.com/saml2/idp/sso
-            #   2. accounts.sap.com validates IDP session cookie, returns
-            #      (200) HTML form with SAMLResponse auto-posted back to SP
-            #   3. softwaredownloads.sap.com processes SAMLResponse, redirects to
-            #      CDN or returns an error HTML page if the file was removed.
-            #
-            # Use stream=True to avoid downloading large binary files.
-            # Read up to 64 KB per HTML page (SAMLResponse base64 can be large).
+            # Follow the tokengen → IDP → ACS chain using stream=True.
+            # Read up to 128 KB per HTML hop (SAMLResponse base64 ≈ 10–20 KB).
             resp = session.get(url, timeout=timeout, allow_redirects=True, stream=True)
 
             for _ in range(6):
                 content_type = resp.headers.get("Content-Type", "")
+
                 if "text/html" not in content_type:
-                    # Binary/non-HTML response — stop here (file exists)
+                    # Binary / non-HTML → file exists
                     resp.close()
                     break
 
-                # Read enough to capture full SAML form (SAMLResponse can be ~10 KB)
-                chunk = resp.raw.read(65536, decode_content=True)
+                chunk = resp.raw.read(131072, decode_content=True)
+                current_url = resp.url
                 resp.close()
                 text = chunk.decode("utf-8", errors="replace")
 
                 fp = _FormParser()
                 fp.feed(text)
 
-                # Follow the form if it's an auto-submit or carries SAML tokens
-                is_saml_form = any(
+                # The IDP login page (j_username present) but WITHOUT a SAMLResponse
+                # or SAMLRequest means the IDP session was not accepted and the user
+                # must log in manually — we cannot proceed, skip this URL.
+                # NOTE: j_username also appears on IDP pages that DO have SAMLRequest
+                # (the form carries the username field as hidden state), so we must
+                # check BOTH: j_username present AND no SAML payload.
+                has_saml_payload = any(
                     k in fp.inputs
-                    for k in ("SAMLResponse", "SAMLRequest", "RelayState", "id_token")
+                    for k in ("SAMLResponse", "SAMLRequest", "id_token")
                 )
                 is_autosubmit = "document.forms[0].submit()" in text
+                is_login_wall = (
+                    "j_username" in fp.inputs
+                    and not has_saml_payload
+                    and not is_autosubmit
+                )
 
-                if not fp.form_action or (not is_saml_form and not is_autosubmit):
-                    # No form to follow — this is the final HTML page
+                if is_login_wall:
+                    return {
+                        "url": url, "source": source,
+                        "sap_url": True, "skipped": True,
+                        "reason": "IDP session not accepted — login form appeared",
+                    }
+
+                if not fp.form_action or (not has_saml_payload and not is_autosubmit):
+                    # No actionable form — this IS the final HTML page.
+                    class _Final:  # noqa: N801
+                        headers = {"Content-Type": "text/html"}
+                        status_code = 200
+                        url = current_url
+                    resp = _Final()
                     break
 
                 action = (
                     fp.form_action
                     if fp.form_action.startswith("http")
-                    else urljoin(resp.url, fp.form_action)
+                    else urljoin(current_url, fp.form_action)
                 )
                 resp = session.post(
                     action,
@@ -363,25 +372,26 @@ def check_url(url, source, timeout, sap_cookie_tuples):
                     stream=True,
                 )
             else:
-                # Loop exhausted — close whatever is open
-                resp.close()
+                # 6 hops exhausted — something unexpected; treat as error HTML
+                try:
+                    resp.close()
+                except Exception:
+                    pass
 
             content_type = resp.headers.get("Content-Type", "")
             content_disp = resp.headers.get("Content-Disposition", "")
             final_url = resp.url
 
-            # If we ended up stuck on the IDP login page after the full chain,
-            # the session cookies didn't work — skip rather than mark broken.
+            # Safety net: if still on accounts.sap.com the session didn't work
             if "accounts.sap.com" in final_url:
                 return {
                     "url": url, "source": source,
                     "sap_url": True, "skipped": True,
-                    "reason": "session expired (stuck on IDP after full SAML chain)",
+                    "reason": "IDP session not accepted — stuck on accounts.sap.com",
                 }
 
-            # After the full chain:
-            #   Valid file   → binary Content-Type or Content-Disposition: attachment
-            #   Removed file → HTTP 200 text/html SAP error page (no download headers)
+            # Valid file   → binary Content-Type or Content-Disposition: attachment
+            # Removed file → text/html with no download headers
             is_html = "text/html" in content_type
             has_download = "attachment" in content_disp or not is_html
             broken = resp.status_code >= 400 or (is_html and not has_download)
@@ -507,9 +517,11 @@ def main():
                     sap_cookie_tuples = False
                 else:
                     print("SAP session verified — download access confirmed.")
-                    # Serialize cookies for thread-safe usage
-                    sap_cookie_tuples = _serialize_cookies(sap_session)
-                    print(f"  ({len(sap_cookie_tuples)} cookies captured)")
+                    # Pass the session object directly; check_url copies the
+                    # cookie jar per URL via _copy_session(), which uses
+                    # RequestsCookieJar.copy() to preserve all Cookie attributes.
+                    sap_cookie_tuples = sap_session
+                    print(f"  ({sum(1 for _ in sap_session.cookies)} cookies captured)")
             else:
                 print("No SAP URLs found to probe; skipping session verification.")
     else:
