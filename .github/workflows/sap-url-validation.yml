@@ -80,22 +80,19 @@ jobs:
 
                   # Start with GET stream as SAP portal sometimes handles HEAD differently
                   res = requests.get(url, headers=headers, auth=auth, stream=True, timeout=15)
+
+                  # Check content type before closing stream
+                  content_type = res.headers.get('Content-Type', '').lower()
                   res.close()
 
-                  if res.status_code < 400:
-                      return url, True, f"HTTP {res.status_code}"
-                  else:
+                  if res.status_code >= 400:
                       return url, False, f"HTTP {res.status_code}"
-              except Exception as e:
-                  return url, False, type(e).__name__
 
-          print(f"Found {len(all_urls)} unique URLs. Starting validation...")
+                  # If a software download returns HTML, the download link is broken or authentication failed
+                  if 'softwaredownloads.sap.com' in domain and 'text/html' in content_type:
+                      return url, False, f"Auth Failed or Broken Link (Returned HTML)"
 
-          errors = []
-          with ThreadPoolExecutor(max_workers=10) as executor:
-              results = executor.map(check_url, all_urls)
-              for url, is_valid, msg in results:
-                  if not is_valid:
+                  return url, True, f"HTTP {res.status_code}"
                       print(f"❌ {url} - {msg}")
                       errors.append((url, msg))
                   # Optionally suppress success prints to keep logs clean
